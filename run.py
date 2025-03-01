@@ -5,6 +5,8 @@ import torch
 import torch.distributed
 import torch.optim as optim
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import os
+import socket
 
 import wandb
 
@@ -218,8 +220,11 @@ def main():
     total_train_steps = 0
 
     if not configs.debug and not configs.only_eval and rank == 0:
+        node_name = socket.gethostname()
+        cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
         wandb_run = wandb.init(project=configs.project, name=configs.name)
         wandb_run.config.update(configs, allow_val_change=True)
+        wandb_run.config.update({"node_name": node_name, "cuda_visible_devices": cuda_visible_devices,})
         text_table = wandb.Table(columns=["step", "text"])
 
     else:
