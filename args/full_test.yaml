@@ -1,0 +1,33 @@
+# need 4 gpus
+
+dataset: gsm8k
+base_model: Qwen/Qwen2.5-0.5b
+
+max_iters: 20
+total_batch_size: 8
+per_device_batch_size: 4
+lr: 1e-4
+
+loss_type: sft # pg, sft, or logp
+
+# sft
+sft:
+  include_cot: True
+  predict_cot: True
+
+# pg and logp
+generation:
+  generations_per_prompt: 2
+  temperature: 1.0
+  top_k: null
+  max_length: 20
+  inject_answer_prompt: True
+  fixed_length: True
+
+# pg
+pg:
+  normalization_type: null # "grpo", "rloo", or "none"
+
+entropy_coef: 0.001
+kl_loss_coef: 0.001 # for grpo
+kl_loss_type: low_var_kl # for grpo
