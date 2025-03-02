@@ -37,29 +37,33 @@ class Coconut(nn.Module):
             self.embedding = self.base_causallm.get_input_embeddings()
 
     def forward(self, input_ids, attention_mask, labels, position_ids, **kwargs):
+        print(f"{input_ids.shape=}")
+        print(f"{attention_mask.shape=}")
+        print(f"{labels.shape=}")
+        print(f"{position_ids.shape=}")
 
         logits = []
 
         latent_indices = (
             input_ids == self.latent_token_id
         ).nonzero()  # (num_latent_tokens_in_the_batch, 2)
+        print(f"{latent_indices=}")
 
         latent_lists = [
             [idx[1].item() for idx in latent_indices if idx[0] == i]
             for i in range(input_ids.shape[0])
         ]  # bs, num_latent_tokens_in_the_instance (difference across the batch)
+        print(f"{latent_lists=}")
 
         max_n_latents = max([len(l) for l in latent_lists])
-
-        next_compute_range = (0, input_ids.shape[1])
-        inputs_embeds = self.embedding(input_ids)
-
         if max_n_latents > 0:
             next_compute_range = (0, latent_indices[:, 1].min().item())
             # before the earliest latent token position
+        else:
+            next_compute_range = (0, input_ids.shape[1])
 
+        inputs_embeds = self.embedding(input_ids)
         kv_cache = None
-
         for pass_idx in range(max_n_latents):
 
             if kv_cache == None:
