@@ -1,4 +1,5 @@
 import torch
+import torch.distributed as dist
 
 
 def careful_repeat(data, num_repeats):
@@ -61,7 +62,7 @@ def single_step(model, next_input, attention_mask, position_ids, past_key_values
 
     if as_full_distribution:
         # next_input is a distribution over the vocabulary (batch_size, 1, vocab_size)
-        all_embeds = model.model.embed_tokens.weight
+        all_embeds = model.module.model.embed_tokens.weight if dist.is_initialized() else model.model.embed_tokens.weight
         hidden_dim = all_embeds.shape[1]
         inputs_embeds = torch.matmul(next_input, all_embeds)
         assert inputs_embeds.shape == (batch_size, 1, hidden_dim)
@@ -72,6 +73,81 @@ def single_step(model, next_input, attention_mask, position_ids, past_key_values
     logits = outputs.logits
     past_key_values = outputs.past_key_values
     return logits, past_key_values
+
+
+def batch_generate_with_method(
+        model,
+        ref_model,
+        max_steps,
+        questions_inputs,
+        temperature=1.0,
+        top_k=None,
+        do_sample=True,
+    ):
+    metrics = {}
+    # generation
+    model = model.module if dist.is_initialized() else model
+    batch_size, prompt_length = questions_inputs["input_ids"].shape
+    gen_outputs = model.generate(
+            input_ids=questions_inputs["input_ids"],
+            attention_mask=questions_inputs["attention_mask"],
+            max_new_tokens=max_steps,
+            temperature=temperature,
+            top_k=top_k,
+            do_sample=do_sample,
+            return_dict_in_generate=True,
+            pad_token_id=model.config.eos_token_id, # to avoid lots of prints but shouldn't change anything
+        )
+    prompt_keys_values = [(k[:, :, :prompt_length-1], v[:, :, :prompt_length-1]) for k, v in gen_outputs.past_key_values]
+    generations = gen_outputs.sequences[:, prompt_length:]
+    # forward pass
+    attention_mask = torch.cat([questions_inputs["attention_mask"], torch.ones((batch_size, generations.shape[1]-1), device=model.device)], dim=1)
+    position_ids = (torch.cumsum(attention_mask, dim=1) - 1)
+    forward_outputs = model(
+        input_ids=torch.cat([questions_inputs["input_ids"][:, -1:], generations[:, :-1]], dim=1),
+        attention_mask=attention_mask,
+        position_ids=position_ids[:, prompt_length-1:],
+        past_key_values=prompt_keys_values,
+        )
+    logits = forward_outputs.logits
+    with torch.no_grad():
+        ref_outputs = ref_model(
+            input_ids=gen_outputs.sequences[:, :-1],
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=None,
+            )
+        ref_logits = ref_outputs.logits[:, prompt_length-1:]
+
+    gen_per_token_logps = torch.gather(logits, 2, generations.to(torch.long).unsqueeze(-1)).squeeze(-1)
+    ref_per_token_logps = torch.gather(ref_logits, 2, generations.to(torch.long).unsqueeze(-1)).squeeze(-1)
+
+    eos_token_id = model.config.eos_token_id
+    eos_occurrences = (generations == eos_token_id).int()
+    eos_mask = torch.cumsum(eos_occurrences, dim=1) <= 1
+    eos_mask = torch.cat([torch.ones((batch_size, 1), device=gen_per_token_logps.device), eos_mask[:, :-1]], dim=1) # include the eos token
+    gen_per_token_logps = gen_per_token_logps * eos_mask
+    ref_per_token_logps = ref_per_token_logps * eos_mask
+
+    pd = torch.nn.functional.softmax(logits, dim=-1)
+    entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
+    entropy = (entropy * eos_mask).mean(-1)
+    metrics["logps"] = gen_per_token_logps.mean()
+    metrics["logps_ref"] = ref_per_token_logps.mean()
+    metrics["logps_diff"] = (gen_per_token_logps - ref_per_token_logps).mean()
+    metrics["entropy"] = entropy.mean()
+    metrics["entropy_std"] = entropy.std() if entropy.numel() > 1 else torch.tensor(0.0, device=entropy.device)
+    metrics["length"] = eos_mask.sum(-1).float().mean()
+    metrics["finished"] = (eos_occurrences.sum(-1) > 0).float().mean()
+
+    x = (None, None, gen_per_token_logps, ref_per_token_logps, entropy)
+    assert x[2].requires_grad == True, f"{x[2].requires_grad=}"
+    assert x[3].requires_grad == False, f"{x[3].requires_grad=}"
+    assert x[4].requires_grad == True, f"{x[4].requires_grad=}"
+
+
+    return x, generations, metrics, (gen_outputs.past_key_values, forward_outputs.past_key_values)
+    
 
 # @torch.no_grad()
 def batch_generate_rnn(
@@ -91,6 +167,15 @@ def batch_generate_rnn(
         loss_type="pg",
         compute_everything=False,
     ):
+    if loss_type == "pg" and not as_full_distribution and not inject_answer_prompt and not dot_by_dot and not compute_everything:
+        return batch_generate_with_method(
+            model=model,
+            ref_model=ref_model,
+            questions_inputs=questions_inputs,
+            max_steps=max_steps,
+            temperature=temperature,
+            top_k=top_k,
+        )
     metrics = {}
     assert not (as_full_distribution and dot_by_dot), f"{as_full_distribution=}, {dot_by_dot=}"
     device = model.device
@@ -213,7 +298,7 @@ def batch_generate_rnn(
 
     ### CONTINUE FORWARD PASS STEPS
     if loss_type == "pg" or compute_everything:
-        for t in range(t, max_steps):
+        for t in range(t, max_steps-1):
             next_token_ids, next_probdists = get_next(logits[:, -1:], temperature=temperature, top_k=top_k)
             all_gen_logits = torch.cat((all_gen_logits, logits[:, -1:]), dim=1)
             all_ref_logits = torch.cat((all_ref_logits, ref_logits[:, -1:]), dim=1)
@@ -249,14 +334,24 @@ def batch_generate_rnn(
     gen_per_token_logps = torch.gather(all_gen_logits, 2, generations_without_injection.to(torch.long).unsqueeze(-1)).squeeze(-1)
     ref_per_token_logps = torch.gather(all_ref_logits, 2, generations_without_injection.to(torch.long).unsqueeze(-1)).squeeze(-1)
 
+    eos_token_id = model.module.config.eos_token_id if dist.is_initialized() else model.config.eos_token_id
+    eos_occurrences = (generations_without_injection == eos_token_id).int()
+    eos_mask = torch.cumsum(eos_occurrences, dim=1) <= 1
+    eos_mask = torch.cat([torch.ones((batch_size, 1), device=device), eos_mask[:, :-1]], dim=1) # include the eos token
+    gen_per_token_logps = gen_per_token_logps * eos_mask
+    ref_per_token_logps = ref_per_token_logps * eos_mask
+
     pd = torch.nn.functional.softmax(all_gen_logits, dim=-1)
     entropy = torch.logsumexp(all_gen_logits, dim=-1) - torch.sum(pd * all_gen_logits, dim=-1)
-    entropy = entropy.mean(-1)
+    entropy = (entropy * eos_mask).mean(-1)
     metrics["logps"] = gen_per_token_logps.mean()
     metrics["logps_ref"] = ref_per_token_logps.mean()
     metrics["logps_diff"] = (gen_per_token_logps - ref_per_token_logps).mean()
     metrics["entropy"] = entropy.mean()
-    metrics["entropy_std"] = entropy.std()
+    metrics["entropy_std"] = entropy.std() if entropy.numel() > 1 else torch.tensor(0.0, device=entropy.device)
+    metrics["length"] = eos_mask.sum(-1).float().mean()
+    metrics["finished"] = (eos_occurrences.sum(-1) > 0).float().mean()
+    metrics["wasted"] = (eos_occurrences.sum(-1) == 0).float().mean()
 
     x = (answer_logps, ref_answer_logps, gen_per_token_logps, ref_per_token_logps, entropy)
     
@@ -296,10 +391,6 @@ if __name__ == "__main__":
     questions_inputs = {k: v.to(device) for k, v in questions_inputs.items()}
     answers_inputs = {k: v.to(device) for k, v in answers_inputs.items()}
 
-    print(f"{tokenizer.eos_token_id=}, {questions_inputs['input_ids'][:, 0]=}")
-
-    
-
     def our_generate(num_steps_):
         x, generations, generation_metrics, past_key_values = batch_generate_rnn(
             model=model,
@@ -315,15 +406,29 @@ if __name__ == "__main__":
             dot_by_dot_id=None,
             inject_answer_prompt=False,
             answer_prompt_ids=None,
+            loss_type="pg",
+            compute_everything=True,
         )
         return generations, past_key_values
+    
+    def our_generate_with_method(num_steps_):
+        x, generations, generation_metrics, (gen_past_kvs, forward_past_kvs) = batch_generate_with_method(
+            model=model,
+            ref_model=ref_model,
+            questions_inputs=questions_inputs,
+            max_steps=num_steps_,
+            temperature=1.0,
+            top_k=None,
+            do_sample=False,
+        )
+        return generations, gen_past_kvs, forward_past_kvs
     
     def generate_with_generate(num_steps_):
         outputs = model.generate(
             input_ids=questions_inputs["input_ids"],
             attention_mask=questions_inputs["attention_mask"],
-            max_new_tokens=num_steps_+1,
-            temperature=0.0,
+            max_new_tokens=num_steps_,
+            temperature=1.0,
             top_k=None,
             do_sample=False,
             return_dict_in_generate=True,
@@ -347,17 +452,27 @@ if __name__ == "__main__":
     # our generate
     generations1, past_key_values1 = our_generate(num_steps)
     print(f"\nREQUIRES GRAD our generate: {past_key_values1[0][0].requires_grad=}") # True
+    # our generate with method
+    generations2, past_key_values2, past_key_values3 = our_generate_with_method(num_steps)
+    print(f"\nREQUIRES GRAD our generate with method: {past_key_values2[0][0].requires_grad=}") # False
+    print(f"\nREQUIRES GRAD our generate with method: {past_key_values3[0][0].requires_grad=}") # True
     # generate with .generate() method
-    generations2, past_key_values2 = generate_with_generate(num_steps)
-    print(f"\nREQUIRES GRAD .generate() method: {past_key_values2[0][0].requires_grad=}") # False
+    generations4, past_key_values4 = generate_with_generate(num_steps)
+    print(f"\nREQUIRES GRAD .generate() method: {past_key_values4[0][0].requires_grad=}") # False
     # forward pass to get grads
     prompt_past_key_values = [(k[:, :, :prompt_length], v[:, :, :prompt_length]) for k, v in past_key_values1]
-    past_key_values3 = forward_pass(generations1[:, :-1], prompt_past_key_values)
-    print(f"\nREQUIRES GRAD forward pass: {past_key_values3[0][0].requires_grad=}") # True
+    past_key_values5 = forward_pass(generations1[:, :-1], prompt_past_key_values)
+    print(f"\nREQUIRES GRAD forward pass: {past_key_values5[0][0].requires_grad=}") # True
 
 
-    padding_mask = torch.ones((batch_size, prompt_length+num_steps), device=device)
+    padding_mask = torch.ones((batch_size, prompt_length-1+num_steps), device=device)
     padding_mask[:, :prompt_length] = questions_inputs["attention_mask"]
+    print(f"\n{padding_mask.unsqueeze(1).unsqueeze(-1).shape=}")
+    print(f"{past_key_values1[0][0].shape=}, {past_key_values1[0][1].shape=}")
+    print(f"{past_key_values2[0][0].shape=}, {past_key_values2[0][1].shape=}")
+    print(f"{past_key_values3[0][0].shape=}, {past_key_values3[0][1].shape=}")
+    print(f"{past_key_values4[0][0].shape=}, {past_key_values4[0][1].shape=}")
+    print(f"{past_key_values5[0][0].shape=}, {past_key_values5[0][1].shape=}")
     def mask_key_values(past_key_values):
         return [
             (key * padding_mask.unsqueeze(1).unsqueeze(-1), value * padding_mask.unsqueeze(1).unsqueeze(-1))
@@ -366,30 +481,41 @@ if __name__ == "__main__":
     past_key_values1 = mask_key_values(past_key_values1)
     past_key_values2 = mask_key_values(past_key_values2)
     past_key_values3 = mask_key_values(past_key_values3)
+    past_key_values4 = mask_key_values(past_key_values4)
+    past_key_values5 = mask_key_values(past_key_values5)
 
     # compare some keys and values
-    for l, (kv1, kv2, kv3) in enumerate(zip(past_key_values1, past_key_values2, past_key_values3)):
+    for l, (kv1, kv2, kv3, kv4, kv5) in enumerate(zip(past_key_values1, past_key_values2, past_key_values3, past_key_values4, past_key_values5)):
         if l == len(past_key_values1) - 1:
+            print(f"Layer {l}")
             for t in range(kv1[0].shape[2]):
-                if t < 3 or t > kv1[0].shape[2] - 3:
+                if t < 2 or t > kv1[0].shape[2] - 3:
                     print(f"START {t=}")
-                    print(f"{t=}: keys: {kv1[0].shape}, {kv2[0].shape}, {kv3[0].shape}")
+                    print(f"{t=}: keys: {kv1[0].shape}, {kv2[0].shape}, {kv3[0].shape}, {kv4[0].shape}, {kv5[0].shape}")
                     print(f"{t=}: keys: {kv1[0][:, 0, t, :3].flatten().tolist()}")
                     print(f"{t=}: keys: {kv2[0][:, 0, t, :3].flatten().tolist()}")
                     print(f"{t=}: keys: {kv3[0][:, 0, t, :3].flatten().tolist()}")
-                    print(f"{t=}: values: {kv1[1].shape}, {kv2[1].shape}, {kv3[1].shape}")
+                    print(f"{t=}: keys: {kv4[0][:, 0, t, :3].flatten().tolist()}")
+                    print(f"{t=}: keys: {kv5[0][:, 0, t, :3].flatten().tolist()}")
+                    print(f"{t=}: values: {kv1[1].shape}, {kv2[1].shape}, {kv3[1].shape}, {kv4[1].shape}, {kv5[1].shape}")
                     print(f"{t=}: values: {kv1[1][:, 0, t, :3].flatten().tolist()}")
                     print(f"{t=}: values: {kv2[1][:, 0, t, :3].flatten().tolist()}")
-                    print(f"{t=}: values: {kv3[1][:, 0, t, :3].flatten().tolist()}\n")
+                    print(f"{t=}: values: {kv3[1][:, 0, t, :3].flatten().tolist()}")
+                    print(f"{t=}: values: {kv4[1][:, 0, t, :3].flatten().tolist()}")
+                    print(f"{t=}: values: {kv5[1][:, 0, t, :3].flatten().tolist()}\n")
                     print(f"END {t=}")
-                    print(f"{t=}: keys: {kv1[0].shape}, {kv2[0].shape}, {kv3[0].shape}")
+                    print(f"{t=}: keys: {kv1[0].shape}, {kv2[0].shape}, {kv3[0].shape}, {kv4[0].shape}, {kv5[0].shape}")
                     print(f"{t=}: keys: {kv1[0][:, 0, t, -3:].flatten().tolist()}")
                     print(f"{t=}: keys: {kv2[0][:, 0, t, -3:].flatten().tolist()}")
                     print(f"{t=}: keys: {kv3[0][:, 0, t, -3:].flatten().tolist()}")
-                    print(f"{t=}: values: {kv1[1].shape}, {kv2[1].shape}, {kv3[1].shape}")
+                    print(f"{t=}: keys: {kv4[0][:, 0, t, -3:].flatten().tolist()}")
+                    print(f"{t=}: keys: {kv5[0][:, 0, t, -3:].flatten().tolist()}")
+                    print(f"{t=}: values: {kv1[1].shape}, {kv2[1].shape}, {kv3[1].shape}, {kv4[1].shape}, {kv5[1].shape}")
                     print(f"{t=}: values: {kv1[1][:, 0, t, -3:].flatten().tolist()}")
                     print(f"{t=}: values: {kv2[1][:, 0, t, -3:].flatten().tolist()}")
-                    print(f"{t=}: values: {kv3[1][:, 0, t, -3:].flatten().tolist()}\n")
+                    print(f"{t=}: values: {kv3[1][:, 0, t, -3:].flatten().tolist()}")
+                    print(f"{t=}: values: {kv4[1][:, 0, t, -3:].flatten().tolist()}")
+                    print(f"{t=}: values: {kv5[1][:, 0, t, -3:].flatten().tolist()}\n")
 
     # compare generations
     for i in range(batch_size):
@@ -399,21 +525,19 @@ if __name__ == "__main__":
         print()
 
     # check equal
-    for i in range(batch_size):
-        key1 = past_key_values1[i][0]
-        value1 = past_key_values1[i][1]
-        key2 = past_key_values2[i][0]
-        value2 = past_key_values2[i][1]
-        key3 = past_key_values3[i][0]
-        value3 = past_key_values3[i][1]
-        assert key1.shape == key2.shape == key3.shape, f"{key1.shape=}, {key2.shape=}, {key3.shape=}"
-        assert value1.shape == value2.shape == value3.shape, f"{value1.shape=}, {value2.shape=}, {value3.shape=}"
-        print(f"Layer {i}: Keys: std1={key1.std().item():.4f}, std2={key2.std().item():.4f}, std3={key3.std().item():.4f}, max_diff 1 vs 2={(key1-key2).abs().max().item():.4f}, max_diff 1 vs 3={(key1-key3).abs().max().item():.4f}")
-        print(f"Layer {i}: Values: std1={value1.std().item():.4f}, std2={value2.std().item():.4f}, std3={value3.std().item():.4f}, max_diff 1 vs 2={(value1-value2).abs().max().item():.4f}, max_diff 1 vs 3={(value1-value3).abs().max().item():.4f}")
+    for i, ((key1, value1), (key2, value2), (key3, value3), (key4, value4), (key5, value5)) in enumerate(zip(past_key_values1, past_key_values2, past_key_values3, past_key_values4, past_key_values5)):
+        assert key1.shape == key2.shape == key3.shape == key4.shape == key5.shape, f"{key1.shape=}, {key2.shape=}, {key3.shape=}, {key4.shape=}, {key5.shape=}"
+        assert value1.shape == value2.shape == value3.shape == value4.shape == value5.shape, f"{value1.shape=}, {value2.shape=}, {value3.shape=}, {value4.shape=}, {value5.shape=}"
+        print(f"Layer {i}: Keys: std1={key1.std().item():.4f}, std2={key2.std().item():.4f}, std3={key3.std().item():.4f}, max_diff 1 vs 2={(key1-key2).abs().max().item():.4f}, max_diff 1 vs 3={(key1-key3).abs().max().item():.4f}, max_diff 1 vs 4={(key1-key4).abs().max().item():.4f}, max_diff 1 vs 5={(key1-key5).abs().max().item():.4f}")
+        print(f"Layer {i}: Values: std1={value1.std().item():.4f}, std2={value2.std().item():.4f}, std3={value3.std().item():.4f}, max_diff 1 vs 2={(value1-value2).abs().max().item():.4f}, max_diff 1 vs 3={(value1-value3).abs().max().item():.4f}, max_diff 1 vs 4={(value1-value4).abs().max().item():.4f}, max_diff 1 vs 5={(value1-value5).abs().max().item():.4f}")
         assert torch.allclose(key1, key2), f"{key1=}, {key2=}"
         assert torch.allclose(value1, value2), f"{value1=}, {value2=}"
         assert torch.allclose(key1, key3, atol=1e-5, rtol=1e-3), f"{key1=}, {key3=}"
         assert torch.allclose(value1, value3, atol=1e-5, rtol=1e-3), f"{value1=}, {value3=}"
+        assert torch.allclose(key1, key4, atol=1e-5, rtol=1e-3), f"{key1=}, {key4=}"
+        assert torch.allclose(value1, value4, atol=1e-5, rtol=1e-3), f"{value1=}, {value4=}"
+        assert torch.allclose(key1, key5, atol=1e-5, rtol=1e-3), f"{key1=}, {key5=}"
+        assert torch.allclose(value1, value5, atol=1e-5, rtol=1e-3), f"{value1=}, {value5=}"
 
     print("Past key values are the same")
     print("Test passed")

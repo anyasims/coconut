@@ -1,15 +1,15 @@
 # need 4 gpus
 
 dataset: gsm8k
-base_model: Qwen/Qwen2.5-0.5b
+base_model: Qwen/Qwen2.5-1.5b
 
-use_wandb: False
+use_wandb: True
 run_name_prefix: "RUNS0"
 wandb_project: coconut
 
 max_iters: 3000
-total_batch_size: 256
-per_device_batch_size: 16
+total_batch_size: 24
+per_device_batch_size: 2 # 4
 lr: 1e-6
 dataset_size: 300 # for debugging to overfit to a small dataset
 seed: 0
@@ -19,19 +19,21 @@ loss:
   sft_include_cot: True
   sft_predict_cot: True
   pg_normalization_type: grpo # grpo, rloo, or none
-  answer_prompt_coef: 0.1
+  answer_prompt_coef: 0.0
   entropy_coef: 0.001
   kl_loss_coef: 0.001
 
 
 # pg and logp
 generation:
-  generations_per_prompt: 8
+  generations_per_prompt: 2 # 4
   temperature: 1.0
   top_k: null
-  max_steps: 30
-  step_for_answer: 20
+  max_steps: 1
+  step_for_answer: 40
   inject_answer_prompt: False
-  as_full_distribution: False
+  as_full_distribution: False # False
   dot_by_dot: False
+  compute_everything: False
+  predict_answer_prompt: False # False
 
