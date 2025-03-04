@@ -4,31 +4,34 @@ dataset: gsm8k
 base_model: Qwen/Qwen2.5-0.5b
 
 use_wandb: False
+run_name_prefix: "RUNS0"
+wandb_project: coconut
 
-max_iters: 20
-total_batch_size: 8
-per_device_batch_size: 4
+max_iters: 3000
+total_batch_size: 256
+per_device_batch_size: 16
 lr: 1e-6
-dataset_size: 100 # for debugging to overfit to a small dataset
+dataset_size: 300 # for debugging to overfit to a small dataset
 seed: 0
 
-
 loss:
-  loss_type: pg # sft, sft_cot, or sft_cot_cot
+  loss_type: pg # sft, pg, or logp
   sft_include_cot: True
   sft_predict_cot: True
-  pg_normalization_type: grpo # "grpo", "rloo", or "none"
+  pg_normalization_type: grpo # grpo, rloo, or none
+  answer_prompt_coef: 0.1
   entropy_coef: 0.001
   kl_loss_coef: 0.001
 
+
 # pg and logp
 generation:
-  generations_per_prompt: 2
+  generations_per_prompt: 8
   temperature: 1.0
   top_k: null
   max_steps: 30
   step_for_answer: 20
-  inject_answer_prompt: True
+  inject_answer_prompt: False
   as_full_distribution: False
   dot_by_dot: False
 
