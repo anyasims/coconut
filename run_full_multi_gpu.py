@@ -1,18 +1,21 @@
 import os
+import socket
 import random
 import time
 import tqdm
+import re
 import hydra
 import wandb
+import gc
 import numpy as np
 import torch
-import torch.distributed as dist
+from omegaconf import OmegaConf
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import DatasetDict
 from torch.utils.data import DataLoader
+import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
-from omegaconf import OmegaConf
 
 from my_utils import careful_repeat, batch_generate_rnn, get_model_param_stats
 
@@ -46,8 +49,8 @@ class Trainer:
         # dataset
         if cfg.dataset == "gsm8k":
             train_dataset = DatasetDict.load_from_disk(f"./data/my_data/gsm8k")["train"]
-            if cfg.dataset_size is not None:
-                train_dataset = train_dataset.select(range(cfg.dataset_size))
+            if self.dataset_size is not None:
+                train_dataset = train_dataset.select(range(self.dataset_size))
         else:
             raise NotImplementedError(f"Dataset {cfg.dataset} not implemented.")
         train_sampler = DistributedSampler(train_dataset, num_replicas=self.world_size, rank=self.rank, shuffle=True)
@@ -72,7 +75,7 @@ class Trainer:
         self.generations_per_prompt = cfg.generation.generations_per_prompt
         assert self.per_device_batch_size % self.generations_per_prompt == 0, f"{self.per_device_batch_size=} {self.generations_per_prompt=}"
         self.per_device_prompt_batch_size = self.per_device_batch_size // self.generations_per_prompt
-        
+        self.dataset_size = cfg.dataset_size
 
         # generation
         self.loss_type = cfg.loss.loss_type
@@ -80,16 +83,20 @@ class Trainer:
             self.temperature = cfg.generation.temperature
             self.top_k = cfg.generation.top_k
             self.max_steps = cfg.generation.max_steps
-            self.step_for_answer = cfg.generation.step_for_answer
-            assert self.step_for_answer < self.max_steps, f"{self.step_for_answer=}, {self.max_steps=}"
+            self.step_for_answer = cfg.generation.step_for_answer if self.loss_type == "logp" or cfg.generation.compute_everything else None
+            if self.step_for_answer is not None:
+                assert self.step_for_answer < self.max_steps, f"{self.step_for_answer=}, {self.max_steps=}"
             self.inject_answer_prompt = cfg.generation.inject_answer_prompt
             self.as_full_distribution = cfg.generation.as_full_distribution
             self.dot_by_dot = cfg.generation.dot_by_dot
             assert not (self.as_full_distribution and self.dot_by_dot), f"{self.as_full_distribution=}, {self.dot_by_dot=}"
-            self.answer_prompt_text = "Answer:"
+            self.answer_prompt_text = " .... Answer:"
             self.answer_prompt_ids = self.tokenizer.encode(self.answer_prompt_text)
             assert len(self.tokenizer.encode("....")) == 1
             self.dot_by_dot_id = self.tokenizer.encode("....")[0]
+            self.predict_answer_prompt = cfg.generation.predict_answer_prompt
+            assert not (self.predict_answer_prompt and self.inject_answer_prompt), f"{self.predict_answer_prompt=}, {self.inject_answer_prompt=}"
+        self.compute_everything = cfg.generation.compute_everything
 
         # loss
         if self.loss_type == "sft":
@@ -97,25 +104,31 @@ class Trainer:
             self.sft_predict_cot = cfg.loss.sft_predict_cot
             raise NotImplementedError("SFT not yet implemented.")
         elif self.loss_type == "pg":
-            self.pg_normalization_type = None if self.generations_per_prompt == 1 else cfg.loss.pg_normalization_type
+            self.pg_normalization_type = "none" if self.generations_per_prompt == 1 else cfg.loss.pg_normalization_type
             self.answer_prompt_coef = cfg.loss.answer_prompt_coef
+            assert self.answer_prompt_coef == 0.0, f"Have removed answer prompt reward for now but have: {self.answer_prompt_coef=}"
         self.entropy_coef = cfg.loss.entropy_coef
         self.kl_loss_coef = cfg.loss.kl_loss_coef
 
         if self.rank == 0:
+            short_model_name = f"Qw{cfg.base_model.split("/")[-1].split("-")[1]}" if "Qwen" in cfg.base_model else cfg.base_model.split("/")[-1]
             # run name
             run_name = f"{cfg.run_name_prefix}-" if cfg.run_name_prefix != "" else ""
+            run_name += f"-{short_model_name}"
             # method
             run_name += f"-{self.loss_type}"
-            run_name += f"-FULL_DIST" if self.as_full_distribution else ""
+            run_name += f"-FULLDIST" if self.as_full_distribution else ""
             run_name += f"-DOT" if self.dot_by_dot else ""
             run_name += f"-INJ" if self.inject_answer_prompt else ""
-            run_name += f"-steps{self.max_steps}_{self.step_for_answer}"
+            run_name += f"-AP" if self.predict_answer_prompt and self.loss_type == "logp" else ""
+            run_name += f"-steps{self.max_steps}"
+            run_name += f"_{self.step_for_answer}" if self.loss_type == "logp" else ""
             run_name += f"-{self.pg_normalization_type}" if self.loss_type == "pg" and self.pg_normalization_type is not None else ""
             # training
             run_name += "-"
             run_name += f"-B{self.total_batch_size}"
             run_name += f"-G{self.generations_per_prompt}" if self.generations_per_prompt != 1 else ""
+            run_name += f"-D{self.dataset_size}" if self.dataset_size is not None else ""
             run_name += f"-lr{cfg.lr:.0e}"
             # generation
             run_name += "-"
@@ -132,10 +145,15 @@ class Trainer:
             self.run_name = run_name
 
             if self.use_wandb:
+                node_name = socket.gethostname()
+                cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+                wandb_cfg = OmegaConf.to_container(cfg)
+                wandb_cfg["node_name"] = node_name
+                wandb_cfg["cuda_visible_devices"] = cuda_visible_devices
 
                 wandb.init(
                     project=cfg.wandb_project,
-                    config=OmegaConf.to_container(cfg),
+                    config=wandb_cfg,
                     name=run_name,
                 )
                 print("WandB logging initialized")
@@ -155,6 +173,7 @@ class Trainer:
             print(f"Gradient accumulation steps: {self.gradient_accumulation_steps}")
             print(f"Generations per prompt: {self.generations_per_prompt}")
             print(f"Per device prompt batch size: {self.per_device_prompt_batch_size}")
+            print(f"Dataset size: {self.dataset_size} (saller for debugging)")
             print(f"-----------------------------------\n")
             print(f"---GENERATION CONFIG:")
             print(f"Temperature: {self.temperature}")
@@ -164,6 +183,9 @@ class Trainer:
             print(f"Inject answer prompt: {self.inject_answer_prompt}")
             print(f"As full distribution: {self.as_full_distribution}")
             print(f"Answer prompt text: {self.answer_prompt_text}, ids: {self.answer_prompt_ids}")
+            print(f"Dot by dot: {self.dot_by_dot}, id: {self.dot_by_dot_id}")
+            print(f"Predict answer prompt: {self.predict_answer_prompt}")
+            print(f"Compute everything: {self.compute_everything}")
             print(f"-----------------------------------\n")
             print(f"---LOSS CONFIG:")
             print(f"Loss type: {self.loss_type}")
@@ -213,45 +235,49 @@ class Trainer:
         contains_answer_prompt = torch.zeros((self.per_device_prompt_batch_size, self.generations_per_prompt), device=self.model.device)
         contains_answer = torch.zeros((self.per_device_prompt_batch_size, self.generations_per_prompt), device=self.model.device)
         generations = generations.reshape(self.per_device_prompt_batch_size, self.generations_per_prompt, -1)
+        decoded_generations = []
+        extracted_answers = []
         for i in range(self.per_device_prompt_batch_size):
             answer_text = answers_text[i]
-            decoded_generations = self.tokenizer.batch_decode(generations[i])
+            decoded_batch = self.tokenizer.batch_decode(generations[i])
             for j in range(self.generations_per_prompt):
-                decoded = decoded_generations[j]
+                decoded = decoded_batch[j].split(self.tokenizer.eos_token)[0]
                 contains_answer_prompt_ij = self.answer_prompt_text in decoded
-                if contains_answer_prompt_ij:
-                    contains_answer_ij = answer_text in decoded.split(self.answer_prompt_text)[1]
-                else:
-                    contains_answer_ij = False
+                numbers = re.findall(r'\d+', decoded)
+                extracted_answer = numbers[-1] if numbers else None
+                contains_answer_ij = extracted_answer == answer_text
                 contains_answer_prompt[i, j] = contains_answer_prompt_ij
                 contains_answer[i, j] = contains_answer_ij
+                decoded_generations.append(decoded)
+                extracted_answers.append(extracted_answer)
         
         ### caluclate rewards
-        if self.generations_per_prompt == 1:
-            assert self.pg_normalization_type == "none", f"{self.pg_normalization_type=}"
         rewards = contains_answer.float()
-        if not self.inject_answer_prompt:
-            rewards += self.answer_prompt_coef * contains_answer_prompt.float()
-        if self.pg_normalization_type == "grpo":
-            normalized_rewards = (rewards - rewards.mean(1, keepdim=True)) / (rewards.std(1, keepdim=True) + 1e-6)
-        elif self.pg_normalization_type == "rloo":
-            group_sum = rewards.sum(1, keepdim=True)
-            normalized_rewards = (group_sum - rewards) / (self.generations_per_prompt - 1)
-        elif self.pg_normalization_type == "none":
-            normalized_rewards = rewards
+        if self.loss_type == "pg":
+            if self.generations_per_prompt == 1:
+                assert self.pg_normalization_type == "none", f"{self.pg_normalization_type=}"
+            if self.pg_normalization_type == "grpo":
+                normalized_rewards = (rewards - rewards.mean(1, keepdim=True)) / (rewards.std(1, keepdim=True) + 1e-6)
+            elif self.pg_normalization_type == "rloo":
+                group_sum = rewards.sum(1, keepdim=True)
+                normalized_rewards = (group_sum - rewards) / (self.generations_per_prompt - 1)
+            elif self.pg_normalization_type == "none":
+                normalized_rewards = rewards
+            else:
+                raise ValueError(f"{self.pg_normalization_type=}")
         else:
-            raise ValueError(f"{self.pg_normalization_type=}")
+            normalized_rewards = None
         
         metrics = {
             "REWARD": rewards.mean(),
-            "reward/reward_std": rewards.std(),
+            "reward/reward_std": rewards.std() if self.per_device_batch_size > 1 else torch.tensor(0, device=self.device),
             "reward/reward_std_within_q": rewards.std(1).mean() if self.generations_per_prompt > 1 else torch.tensor(0, device=self.device),
             "reward/reward_std_between_q": rewards.mean(1).std() if self.per_device_prompt_batch_size > 1 else torch.tensor(0, device=self.device),
         }
 
         rewards = rewards.reshape(self.per_device_batch_size)
-        normalized_rewards = normalized_rewards.reshape(self.per_device_batch_size)
-        return rewards, normalized_rewards, metrics
+        normalized_rewards = normalized_rewards.reshape(self.per_device_batch_size) if normalized_rewards is not None else None
+        return rewards, normalized_rewards, decoded_generations, extracted_answers, metrics
     
     def get_loss(self, x, rewards):
         metrics = {}
@@ -285,7 +311,7 @@ class Trainer:
         for i in tqdm.tqdm(range(num_iters), desc="Training"):
             self.train_loader.sampler.set_epoch(i) # shuffling every iter for now to avoid the effect of epochs
             # GRADIENT ACCUMULATION
-            for j in range(self.gradient_accumulation_steps):
+            for j in tqdm.tqdm(range(self.gradient_accumulation_steps), desc="Gradient accumulation", disable=False):
             
                 # GENERATE ROLLOUTS
                 start_time = time.time()
@@ -296,13 +322,17 @@ class Trainer:
                 questions_text = dataset_batch["question"]
                 # cot_text = dataset_batch["reasoning"]
                 answers_text = dataset_batch["answer"]
+                if self.predict_answer_prompt:
+                    answers_text_input = [self.answer_prompt_text + " " + a.strip() for a in answers_text]
+                else:
+                    answers_text_input = answers_text
 
                 if self.loss_type == "sft":
                     raise NotImplementedError
                 
                 else:
                     questions_inputs = self.tokenizer(questions_text, return_tensors="pt", padding=True, padding_side="left")
-                    answers_inputs = self.tokenizer(answers_text, return_tensors="pt", padding=True)
+                    answers_inputs = self.tokenizer(answers_text_input, return_tensors="pt", padding=True)
                     questions_inputs = {k: v.to(self.model.device) for k, v in questions_inputs.items()}
                     answers_inputs = {k: v.to(self.model.device) for k, v in answers_inputs.items()}
 
@@ -326,12 +356,12 @@ class Trainer:
                         inject_answer_prompt=self.inject_answer_prompt,
                         answer_prompt_ids=self.answer_prompt_ids,
                         loss_type=self.loss_type,
-                        compute_everything=False,
+                        compute_everything=self.compute_everything,
                     )
                     generation_metrics = {f"gen/{k}": v for k, v in generation_metrics.items()}
 
                     ### rewards
-                    rewards, normalized_rewards, reward_metrics = self.get_rewards(generations, answers_text)
+                    rewards, normalized_rewards, decoded_generations, extracted_answers, reward_metrics = self.get_rewards(generations, answers_text)
                     reward_metrics = {k if k == "REWARD" else f"reward/{k}": v for k, v in reward_metrics.items()}
                     
                 # COMPUTE LOSS
@@ -362,16 +392,24 @@ class Trainer:
                 if self.use_wandb:
                     wandb.log(metrics_s)
                 if i % 1 == 0 or i == self.max_iters - 1:
+                    lengths = (torch.cumsum((generations == self.tokenizer.eos_token_id).int(), dim=1) == 0).int().sum(dim=-1)
                     print(f"({metrics_s})\n\niter {i}: REWARD={metrics_s['REWARD']:.2f}")
                     num_to_print = min(3, self.per_device_batch_size)
-                    decoded = [self.tokenizer.decode(generations[k]) for k in range(num_to_print)]
+                    print("-"*50)
                     for k in range(num_to_print):
                         print(f"EXAMPLE {k}: (REWARD={rewards[k].item():.4f}):")
                         print(f"    QUESTION: {questions_text[k//self.generations_per_prompt]}")
-                        print(f"    GENERATION: {decoded[k]}")
+                        print(f"    GENERATION: {decoded_generations[k]}")
+                        print(f"    EXTRACTED ANSWER: {extracted_answers[k]}")
                         print(f"    ANSWER: {answers_text[k//self.generations_per_prompt]}")
+                        print(f"    LENGTH: {lengths[k]}")
                         print("-"*50)
                     print("\n\n")
+
+            # clenup
+            del x, normalized_rewards, generations
+            gc.collect()
+            torch.cuda.empty_cache()
 
         if self.rank == 0:
             print(f"Training time: {time.time()-start_time:.1f}s")
@@ -391,6 +429,7 @@ def main(cfg):
     dist.init_process_group(backend="nccl")
     trainer = Trainer(cfg)
     trainer.train()
+    dist.barrier()
     dist.destroy_process_group()
 
 
@@ -398,5 +437,4 @@ if __name__ == '__main__':
     main()
 
 
-
-# CUDA_VISIBLE_DEVICES=3,4,5,6 torchrun --nproc_per_node=4 test.py
+# CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 run_full_multi_gpu.py
