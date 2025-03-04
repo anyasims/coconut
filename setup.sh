@@ -1,6 +1,6 @@
 #!/bin/bash
 ## First:
-# docker run --name asims1-c1 --hostname $(hostname) --shm-size=10.24gb --user $(id -u) -v $(pwd):/home/anya -v /scratch/local/homes/80/anya:/scratch/anya -it --gpus '"device=0,1,2,3,4,5,6,7"' asims1
+# docker run --name asims1-c1 --hostname $(hostname) --shm-size=16.0gb --user $(id -u) -v $(pwd):/home/anya -v /scratch/local/homes/80/anya:/scratch/anya -it --gpus '"device=0,1,2,3,4,5,6,7"' asims1
 # docker exec -it asims1-c1 /bin/bash
 # Or if container not running:
 # docker start asims1-c1
