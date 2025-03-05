@@ -13,29 +13,25 @@ from omegaconf import OmegaConf
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import DatasetDict
 from torch.utils.data import DataLoader
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
 
 from my_utils import careful_repeat, batch_generate_rnn, get_model_param_stats
 
 class Trainer:
     def __init__(self, cfg) -> None:
-        self.world_size = int(os.environ["WORLD_SIZE"])
-        self.rank = int(os.environ["RANK"])
-        self.local_rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(self.local_rank)
-        self.device = torch.device("cuda", self.local_rank)
+        self.world_size = torch.cuda.device_count()
+        self.rank = 0 # dummy for now
+        self.local_rank = None
+        assert torch.cuda.is_available(), "CUDA not available"
+        assert self.world_size == 1, "Only single GPU training is supported"
+        self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
         # config
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.base_model)
         self.set_config(cfg)
 
         # model
-        model = AutoModelForCausalLM.from_pretrained(cfg.base_model).to(self.device)
-        ref_model = AutoModelForCausalLM.from_pretrained(cfg.base_model).to(self.device)
-        self.model = DDP(model, device_ids=[self.local_rank])
-        self.ref_model = DDP(ref_model, device_ids=[self.local_rank])
+        self.model = AutoModelForCausalLM.from_pretrained(cfg.base_model).to(self.device)
+        self.ref_model = AutoModelForCausalLM.from_pretrained(cfg.base_model).to(self.device)
         for param in self.ref_model.parameters():
             param.requires_grad = False
 
@@ -53,8 +49,7 @@ class Trainer:
                 train_dataset = train_dataset.select(range(self.dataset_size))
         else:
             raise NotImplementedError(f"Dataset {cfg.dataset} not implemented.")
-        train_sampler = DistributedSampler(train_dataset, num_replicas=self.world_size, rank=self.rank, shuffle=True)
-        self.train_loader = DataLoader(train_dataset, batch_size=self.per_device_prompt_batch_size, sampler=train_sampler)
+        self.train_dataset = train_dataset
 
         self.ctx = self._setup_ctx()
 
@@ -82,15 +77,15 @@ class Trainer:
         if self.loss_type in ["pg", "logp"]:
             self.temperature = cfg.generation.temperature
             self.top_k = cfg.generation.top_k
-            self.max_steps = cfg.generation.max_steps
+            self.max_length = cfg.generation.max_length
             self.step_for_answer = cfg.generation.step_for_answer if self.loss_type == "logp" or cfg.generation.compute_everything else None
             if self.step_for_answer is not None:
-                assert self.step_for_answer < self.max_steps, f"{self.step_for_answer=}, {self.max_steps=}"
+                assert self.step_for_answer < self.max_length, f"{self.step_for_answer=}, {self.max_length=}"
             self.inject_answer_prompt = cfg.generation.inject_answer_prompt
             self.as_full_distribution = cfg.generation.as_full_distribution
             self.dot_by_dot = cfg.generation.dot_by_dot
             assert not (self.as_full_distribution and self.dot_by_dot), f"{self.as_full_distribution=}, {self.dot_by_dot=}"
-            self.answer_prompt_text = " .... Answer:"
+            self.answer_prompt_text = " ....Answer:"
             self.answer_prompt_ids = self.tokenizer.encode(self.answer_prompt_text)
             assert len(self.tokenizer.encode("....")) == 1
             self.dot_by_dot_id = self.tokenizer.encode("....")[0]
@@ -121,7 +116,7 @@ class Trainer:
             run_name += f"-DOT" if self.dot_by_dot else ""
             run_name += f"-INJ" if self.inject_answer_prompt else ""
             run_name += f"-AP" if self.predict_answer_prompt and self.loss_type == "logp" else ""
-            run_name += f"-steps{self.max_steps}"
+            run_name += f"-steps{self.max_length}"
             run_name += f"_{self.step_for_answer}" if self.loss_type == "logp" else ""
             run_name += f"-{self.pg_normalization_type}" if self.loss_type == "pg" and self.pg_normalization_type is not None else ""
             # training
@@ -178,7 +173,7 @@ class Trainer:
             print(f"---GENERATION CONFIG:")
             print(f"Temperature: {self.temperature}")
             print(f"Top k: {self.top_k}")
-            print(f"Max length: {self.max_steps}")
+            print(f"Max length: {self.max_length}")
             print(f"Step for answer: {self.step_for_answer}")
             print(f"Inject answer prompt: {self.inject_answer_prompt}")
             print(f"As full distribution: {self.as_full_distribution}")
@@ -309,7 +304,6 @@ class Trainer:
         start_time = time.time()
         num_iters = self.max_iters if num_iters is None else num_iters
         for i in tqdm.tqdm(range(num_iters), desc="Training"):
-            self.train_loader.sampler.set_epoch(i) # shuffling every iter for now to avoid the effect of epochs
             # GRADIENT ACCUMULATION
             for j in tqdm.tqdm(range(self.gradient_accumulation_steps), desc="Gradient accumulation", disable=False):
             
@@ -318,7 +312,9 @@ class Trainer:
                 self.model.eval()
                 # with torch.no_grad():
                 # get questions (and answers)
-                dataset_batch = next(iter(self.train_loader))
+                # sample batch randomly from the dataset
+                indices = random.sample(range(len(self.train_dataset)), self.per_device_prompt_batch_size)
+                dataset_batch = self.train_dataset.select(indices)
                 questions_text = dataset_batch["question"]
                 # cot_text = dataset_batch["reasoning"]
                 answers_text = dataset_batch["answer"]
@@ -346,7 +342,7 @@ class Trainer:
                         ref_model=self.ref_model,
                         questions_inputs=questions_inputs,
                         answers_inputs=answers_inputs,
-                        max_steps=self.max_steps,
+                        max_length=self.max_length,
                         step_for_answer=self.step_for_answer,
                         temperature=self.temperature,
                         top_k=self.top_k,
@@ -382,39 +378,36 @@ class Trainer:
 
             # LOG
             metrics_s = {k: v / self.gradient_accumulation_steps for k, v in metrics_s.items()}
-            for k, v in metrics_s.items():
-                dist.all_reduce(v, op=dist.ReduceOp.SUM)
             metrics_s = {k: v.item() / self.world_size for k, v in metrics_s.items()}
             param_metrics = get_model_param_stats(self.model, self.ref_model)
             metrics_s.update({f"params/{k}": v for k, v in param_metrics.items()})
             metrics_s.update({"iter": i, "lr": self.optimizer.param_groups[0]["lr"]})
-            if self.rank == 0:
-                if self.use_wandb:
-                    wandb.log(metrics_s)
-                if i % 1 == 0 or i == self.max_iters - 1:
-                    lengths = (torch.cumsum((generations == self.tokenizer.eos_token_id).int(), dim=1) == 0).int().sum(dim=-1)
-                    print(f"({metrics_s})\n\niter {i}: REWARD={metrics_s['REWARD']:.2f}")
-                    num_to_print = min(3, self.per_device_batch_size)
+            if self.use_wandb:
+                wandb.log(metrics_s)
+            if i % 1 == 0 or i == self.max_iters - 1:
+                lengths = (torch.cumsum((generations == self.tokenizer.eos_token_id).int(), dim=1) == 0).int().sum(dim=-1)
+                print(f"({metrics_s})\n\niter {i}: REWARD={metrics_s['REWARD']:.2f}")
+                num_to_print = min(3, self.per_device_batch_size)
+                print("-"*50)
+                for k in range(num_to_print):
+                    print(f"EXAMPLE {k}: (REWARD={rewards[k].item():.4f}):")
+                    print(f"    QUESTION: {questions_text[k//self.generations_per_prompt]}")
+                    print(f"    GENERATION: {decoded_generations[k]}")
+                    print(f"    EXTRACTED ANSWER: {extracted_answers[k]}")
+                    print(f"    ANSWER: {answers_text[k//self.generations_per_prompt]}")
+                    print(f"    LENGTH: {lengths[k]}")
                     print("-"*50)
-                    for k in range(num_to_print):
-                        print(f"EXAMPLE {k}: (REWARD={rewards[k].item():.4f}):")
-                        print(f"    QUESTION: {questions_text[k//self.generations_per_prompt]}")
-                        print(f"    GENERATION: {decoded_generations[k]}")
-                        print(f"    EXTRACTED ANSWER: {extracted_answers[k]}")
-                        print(f"    ANSWER: {answers_text[k//self.generations_per_prompt]}")
-                        print(f"    LENGTH: {lengths[k]}")
-                        print("-"*50)
-                    print("\n\n")
+                print("\n\n")
 
             # clenup
             del x, normalized_rewards, generations
             gc.collect()
             torch.cuda.empty_cache()
 
-        if self.rank == 0:
-            print(f"Training time: {time.time()-start_time:.1f}s")
-            print("Training complete")
-            wandb.finish()
+
+        print(f"Training time: {time.time()-start_time:.1f}s")
+        print("Training complete")
+        wandb.finish()
             
     def train(self, num_iters=None):
         """Train the model"""
@@ -426,15 +419,13 @@ class Trainer:
 
 @hydra.main(config_path="args", config_name="full_test", version_base=None)
 def main(cfg):
-    dist.init_process_group(backend="nccl")
     trainer = Trainer(cfg)
     trainer.train()
-    dist.barrier()
-    dist.destroy_process_group()
 
 
 if __name__ == '__main__':
     main()
 
 
-# CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 run_full_multi_gpu.py
+
+# CUDA_VISIBLE_DEVICES=0 python run_full_single_gpu.py

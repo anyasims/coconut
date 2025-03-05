@@ -74,11 +74,10 @@ def single_step(model, next_input, attention_mask, position_ids, past_key_values
     past_key_values = outputs.past_key_values
     return logits, past_key_values
 
-
-def batch_generate_with_method(
+def batch_generate_with_method_low_memory(
         model,
         ref_model,
-        max_steps,
+        max_length,
         questions_inputs,
         temperature=1.0,
         top_k=None,
@@ -88,16 +87,92 @@ def batch_generate_with_method(
     # generation
     model = model.module if dist.is_initialized() else model
     batch_size, prompt_length = questions_inputs["input_ids"].shape
-    gen_outputs = model.generate(
-            input_ids=questions_inputs["input_ids"],
-            attention_mask=questions_inputs["attention_mask"],
-            max_new_tokens=max_steps,
-            temperature=temperature,
-            top_k=top_k,
-            do_sample=do_sample,
-            return_dict_in_generate=True,
-            pad_token_id=model.config.eos_token_id, # to avoid lots of prints but shouldn't change anything
-        )
+    with torch.no_grad():
+        prompt_generations = model.generate(
+                input_ids=questions_inputs["input_ids"],
+                attention_mask=questions_inputs["attention_mask"],
+                max_new_tokens=max_length-prompt_length,
+                temperature=temperature,
+                top_k=top_k,
+                do_sample=do_sample,
+                pad_token_id=model.config.eos_token_id, # to avoid lots of prints but shouldn't change anything
+            )
+    # forward pass
+    attention_mask = torch.ones_like(prompt_generations[:, :-1])
+    attention_mask[:, :prompt_length] = questions_inputs["attention_mask"]
+    position_ids = (torch.cumsum(attention_mask, dim=1) - 1)
+    logits = model(
+        input_ids=prompt_generations[:, :-1],
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=None,
+        ).logits
+    with torch.no_grad():
+        ref_logits = ref_model(
+            input_ids=prompt_generations[:, :-1],
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=None,
+            ).logits
+    generations = prompt_generations[:, prompt_length:]
+    logits = logits[:, prompt_length-1:]
+    ref_logits = ref_logits[:, prompt_length-1:]
+    gen_per_token_logps = torch.gather(logits, 2, generations.to(torch.long).unsqueeze(-1)).squeeze(-1)
+    ref_per_token_logps = torch.gather(ref_logits, 2, generations.to(torch.long).unsqueeze(-1)).squeeze(-1)
+
+    eos_token_id = model.config.eos_token_id
+    eos_occurrences = (generations == eos_token_id).int()
+    eos_mask = torch.cumsum(eos_occurrences, dim=1) <= 1
+    eos_mask = torch.cat([torch.ones((batch_size, 1), device=gen_per_token_logps.device), eos_mask[:, :-1]], dim=1) # include the eos token
+    gen_per_token_logps = gen_per_token_logps * eos_mask
+    ref_per_token_logps = ref_per_token_logps * eos_mask
+
+    pd = torch.nn.functional.softmax(logits, dim=-1)
+    entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
+    entropy = (entropy * eos_mask).mean(-1)
+    metrics["logps"] = gen_per_token_logps.mean()
+    metrics["logps_ref"] = ref_per_token_logps.mean()
+    metrics["logps_diff"] = (gen_per_token_logps - ref_per_token_logps).mean()
+    metrics["entropy"] = entropy.mean()
+    metrics["entropy_std"] = entropy.std() if entropy.numel() > 1 else torch.tensor(0.0, device=entropy.device)
+    metrics["length"] = eos_mask.sum(-1).float().mean()
+    metrics["finished"] = (eos_occurrences.sum(-1) > 0).float().mean()
+
+    x = (None, None, gen_per_token_logps, ref_per_token_logps, entropy)
+    assert x[2].requires_grad == True, f"{x[2].requires_grad=}"
+    assert x[3].requires_grad == False, f"{x[3].requires_grad=}"
+    assert x[4].requires_grad == True, f"{x[4].requires_grad=}"
+
+
+    return x, generations, metrics, None
+    
+
+
+
+def batch_generate_with_method(
+        model,
+        ref_model,
+        max_length,
+        questions_inputs,
+        temperature=1.0,
+        top_k=None,
+        do_sample=True,
+    ):
+    metrics = {}
+    # generation
+    model = model.module if dist.is_initialized() else model
+    batch_size, prompt_length = questions_inputs["input_ids"].shape
+    with torch.no_grad():
+        gen_outputs = model.generate(
+                input_ids=questions_inputs["input_ids"],
+                attention_mask=questions_inputs["attention_mask"],
+                max_new_tokens=max_length-prompt_length,
+                temperature=temperature,
+                top_k=top_k,
+                do_sample=do_sample,
+                return_dict_in_generate=True,
+                pad_token_id=model.config.eos_token_id, # to avoid lots of prints but shouldn't change anything
+            )
     prompt_keys_values = [(k[:, :, :prompt_length-1], v[:, :, :prompt_length-1]) for k, v in gen_outputs.past_key_values]
     generations = gen_outputs.sequences[:, prompt_length:]
     # forward pass
@@ -155,7 +230,7 @@ def batch_generate_rnn(
         ref_model,
         questions_inputs,
         answers_inputs,
-        max_steps=30,
+        max_length=200,
         step_for_answer=20,
         temperature=1.0,
         top_k=None,
@@ -168,11 +243,11 @@ def batch_generate_rnn(
         compute_everything=False,
     ):
     if loss_type == "pg" and not as_full_distribution and not inject_answer_prompt and not dot_by_dot and not compute_everything:
-        return batch_generate_with_method(
+        return batch_generate_with_method_low_memory(
             model=model,
             ref_model=ref_model,
             questions_inputs=questions_inputs,
-            max_steps=max_steps,
+            max_length=max_length,
             temperature=temperature,
             top_k=top_k,
         )
@@ -185,6 +260,8 @@ def batch_generate_rnn(
     ref_model.eval()
     batch_size = questions_inputs["input_ids"].shape[0]
     prompt_length = questions_inputs["input_ids"].shape[1]
+    answer_length = answers_inputs["input_ids"].shape[1]
+    assert prompt_length + step_for_answer + answer_length < max_length, f"{prompt_length=}, {step_for_answer=}, {answer_length=}, {max_length=}"
 
     #### PROMPT FORWARD PASS
     position_ids = questions_inputs["attention_mask"].cumsum(dim=1) - 1
@@ -298,7 +375,7 @@ def batch_generate_rnn(
 
     ### CONTINUE FORWARD PASS STEPS
     if loss_type == "pg" or compute_everything:
-        for t in range(t, max_steps-1):
+        for t in range(t, max_length-prompt_length-1):
             next_token_ids, next_probdists = get_next(logits[:, -1:], temperature=temperature, top_k=top_k)
             all_gen_logits = torch.cat((all_gen_logits, logits[:, -1:]), dim=1)
             all_ref_logits = torch.cat((all_ref_logits, ref_logits[:, -1:]), dim=1)
@@ -397,7 +474,7 @@ if __name__ == "__main__":
             ref_model=ref_model,
             questions_inputs=questions_inputs,
             answers_inputs=answers_inputs,
-            max_steps=num_steps_,
+            max_length=num_steps_,
             step_for_answer=20,
             temperature=0.0,
             top_k=None,
@@ -416,7 +493,7 @@ if __name__ == "__main__":
             model=model,
             ref_model=ref_model,
             questions_inputs=questions_inputs,
-            max_steps=num_steps_,
+            max_length=num_steps_,
             temperature=1.0,
             top_k=None,
             do_sample=False,
@@ -561,7 +638,7 @@ if __name__ == "__main__":
     #         ref_model=ref_model,
     #         questions_inputs=questions_inputs,
     #         answers_inputs=answers_inputs,
-    #         max_steps=num_steps,
+    #         max_length=num_steps,
     #         step_for_answer=20,
     #         temperature=0.0,
     #         top_k=None,
