@@ -14,7 +14,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import DatasetDict
 from torch.utils.data import DataLoader
 
-from my_utils import careful_repeat, batch_generate_rnn, get_model_param_stats
+from my_utils2 import careful_repeat, batch_generate_rnn, get_model_param_stats
 
 class Trainer:
     def __init__(self, cfg) -> None:
@@ -76,32 +76,11 @@ class Trainer:
         self.loss_type = cfg.loss.loss_type
         if self.loss_type in ["pg", "logp"]:
             self.temperature = cfg.generation.temperature
-            self.top_k = cfg.generation.top_k
             self.max_length = cfg.generation.max_length
-            self.step_for_answer = cfg.generation.step_for_answer if self.loss_type == "logp" or cfg.generation.compute_everything else None
-            if self.step_for_answer is not None:
-                assert self.step_for_answer < self.max_length, f"{self.step_for_answer=}, {self.max_length=}"
-            self.inject_answer_prompt = cfg.generation.inject_answer_prompt
-            self.as_full_distribution = cfg.generation.as_full_distribution
-            self.dot_by_dot = cfg.generation.dot_by_dot
-            assert not (self.as_full_distribution and self.dot_by_dot), f"{self.as_full_distribution=}, {self.dot_by_dot=}"
-            self.answer_prompt_text = " ....Answer:"
-            self.answer_prompt_ids = self.tokenizer.encode(self.answer_prompt_text)
-            assert len(self.tokenizer.encode("....")) == 1
-            self.dot_by_dot_id = self.tokenizer.encode("....")[0]
-            self.predict_answer_prompt = cfg.generation.predict_answer_prompt
-            assert not (self.predict_answer_prompt and self.inject_answer_prompt), f"{self.predict_answer_prompt=}, {self.inject_answer_prompt=}"
-        self.compute_everything = cfg.generation.compute_everything
 
         # loss
-        if self.loss_type == "sft":
-            self.sft_include_cot = cfg.loss.sft_include_cot
-            self.sft_predict_cot = cfg.loss.sft_predict_cot
-            raise NotImplementedError("SFT not yet implemented.")
-        elif self.loss_type == "pg":
+        if self.loss_type == "pg":
             self.pg_normalization_type = "none" if self.generations_per_prompt == 1 else cfg.loss.pg_normalization_type
-            self.answer_prompt_coef = cfg.loss.answer_prompt_coef
-            assert self.answer_prompt_coef == 0.0, f"Have removed answer prompt reward for now but have: {self.answer_prompt_coef=}"
         self.entropy_coef = cfg.loss.entropy_coef
         self.kl_loss_coef = cfg.loss.kl_loss_coef
 
@@ -112,12 +91,7 @@ class Trainer:
             run_name += f"-{short_model_name}"
             # method
             run_name += f"-{self.loss_type}"
-            run_name += f"-FULLDIST" if self.as_full_distribution else ""
-            run_name += f"-DOT" if self.dot_by_dot else ""
-            run_name += f"-INJ" if self.inject_answer_prompt else ""
-            run_name += f"-AP" if self.predict_answer_prompt and self.loss_type == "logp" else ""
             run_name += f"-steps{self.max_length}"
-            run_name += f"_{self.step_for_answer}" if self.loss_type == "logp" else ""
             run_name += f"-{self.pg_normalization_type}" if self.loss_type == "pg" and self.pg_normalization_type is not None else ""
             # training
             run_name += "-"
@@ -128,9 +102,7 @@ class Trainer:
             # generation
             run_name += "-"
             run_name += f"-T{self.temperature}" if self.temperature != 1.0 else ""
-            run_name += f"-topK{self.top_k}" if self.top_k is not None else ""
             # loss
-            run_name += f"-a{self.answer_prompt_coef}" if self.loss_type == "pg" else ""
             run_name += f"-kl{self.kl_loss_coef}" if self.kl_loss_coef != 0.0 else ""
             run_name += f"-ent{self.entropy_coef}" if self.entropy_coef != 0.0 else ""
             run_name += f"--seed{self.seed}" if self.seed != 0 else ""
@@ -169,25 +141,15 @@ class Trainer:
             print(f"Generations per prompt: {self.generations_per_prompt}")
             print(f"Per device prompt batch size: {self.per_device_prompt_batch_size}")
             print(f"Dataset size: {self.dataset_size} (saller for debugging)")
+            print(f"Lr: {cfg.lr}")
             print(f"-----------------------------------\n")
             print(f"---GENERATION CONFIG:")
             print(f"Temperature: {self.temperature}")
-            print(f"Top k: {self.top_k}")
             print(f"Max length: {self.max_length}")
-            print(f"Step for answer: {self.step_for_answer}")
-            print(f"Inject answer prompt: {self.inject_answer_prompt}")
-            print(f"As full distribution: {self.as_full_distribution}")
-            print(f"Answer prompt text: {self.answer_prompt_text}, ids: {self.answer_prompt_ids}")
-            print(f"Dot by dot: {self.dot_by_dot}, id: {self.dot_by_dot_id}")
-            print(f"Predict answer prompt: {self.predict_answer_prompt}")
-            print(f"Compute everything: {self.compute_everything}")
             print(f"-----------------------------------\n")
             print(f"---LOSS CONFIG:")
             print(f"Loss type: {self.loss_type}")
-            if self.loss_type == "sft":
-                print(f"SFT include cot: {self.sft_include_cot}")
-                print(f"SFT predict cot: {self.sft_predict_cot}")
-            elif self.loss_type == "pg":
+            if self.loss_type == "pg":
                 print(f"PG normalization type: {self.pg_normalization_type}")
             print(f"Entropy coef: {self.entropy_coef}")
             print(f"KL loss coef: {self.kl_loss_coef}")
@@ -227,7 +189,6 @@ class Trainer:
     def get_rewards(self, generations, answers_text):
         """Get rewards"""
         ### check for answer
-        contains_answer_prompt = torch.zeros((self.per_device_prompt_batch_size, self.generations_per_prompt), device=self.model.device)
         contains_answer = torch.zeros((self.per_device_prompt_batch_size, self.generations_per_prompt), device=self.model.device)
         generations = generations.reshape(self.per_device_prompt_batch_size, self.generations_per_prompt, -1)
         decoded_generations = []
@@ -237,11 +198,9 @@ class Trainer:
             decoded_batch = self.tokenizer.batch_decode(generations[i])
             for j in range(self.generations_per_prompt):
                 decoded = decoded_batch[j].split(self.tokenizer.eos_token)[0]
-                contains_answer_prompt_ij = self.answer_prompt_text in decoded
                 numbers = re.findall(r'\d+', decoded)
                 extracted_answer = numbers[-1] if numbers else None
                 contains_answer_ij = extracted_answer == answer_text
-                contains_answer_prompt[i, j] = contains_answer_prompt_ij
                 contains_answer[i, j] = contains_answer_ij
                 decoded_generations.append(decoded)
                 extracted_answers.append(extracted_answer)
@@ -276,27 +235,33 @@ class Trainer:
     
     def get_loss(self, x, rewards):
         metrics = {}
-        pg_loss, logp_loss = torch.tensor(0.0, device=self.model.device), torch.tensor(0.0, device=self.model.device)
-        if self.loss_type == "sft":
-            raise NotImplementedError
-        else:
-            answer_logps, _, gen_per_token_logps, ref_per_token_logps, entropy = x
-            if self.loss_type == "pg":
-                pg_loss = - torch.exp(gen_per_token_logps - gen_per_token_logps.detach()).mean(-1) * rewards
-            elif self.loss_type == "logp":
-                logp_loss = - answer_logps
-            else:
-                raise ValueError(f"{self.loss_type=}")
+        if self.loss_type == "pg":
+            gen_per_token_logps, ref_per_token_logps, entropy = x
+            pg_loss = - torch.exp(gen_per_token_logps - gen_per_token_logps.detach()).mean(-1) * rewards
             kl = (torch.exp(ref_per_token_logps - gen_per_token_logps) - (ref_per_token_logps - gen_per_token_logps) - 1).mean(-1)
-            loss = pg_loss + logp_loss + self.kl_loss_coef * kl - self.entropy_coef * entropy
-            loss = loss.mean()
+            loss = pg_loss + self.kl_loss_coef * kl - self.entropy_coef * entropy
 
-            metrics["loss"] = loss
+            metrics["loss"] = loss.mean()
             metrics["pg_loss"] = pg_loss.mean()
-            metrics["logp_loss"] = logp_loss.mean()
             metrics["kl"] = kl.mean()
             metrics["entropy"] = entropy.mean()
-        return loss / self.gradient_accumulation_steps, metrics
+
+
+        elif self.loss_type == "logp":
+            answer_logps, entropy, full_kl = x
+
+            logp_loss = - answer_logps
+            loss = logp_loss + self.kl_loss_coef * full_kl - self.entropy_coef * entropy
+
+            metrics["loss"] = loss.mean()
+            metrics["logp_loss"] = logp_loss.mean()
+            metrics["kl"] = full_kl.mean()
+            metrics["entropy"] = entropy.mean()
+
+        else:
+            raise ValueError(f"{self.loss_type=}")
+        
+        return loss.mean() / self.gradient_accumulation_steps, metrics
 
 
     def run_training_loop(self, num_iters=None):
@@ -310,7 +275,6 @@ class Trainer:
                 # GENERATE ROLLOUTS
                 start_time = time.time()
                 self.model.eval()
-                # with torch.no_grad():
                 # get questions (and answers)
                 # sample batch randomly from the dataset
                 indices = random.sample(range(len(self.train_dataset)), self.per_device_prompt_batch_size)
@@ -318,47 +282,29 @@ class Trainer:
                 questions_text = dataset_batch["question"]
                 # cot_text = dataset_batch["reasoning"]
                 answers_text = dataset_batch["answer"]
-                if self.predict_answer_prompt:
-                    answers_text_input = [self.answer_prompt_text + " " + a.strip() for a in answers_text]
-                else:
-                    answers_text_input = answers_text
 
-                if self.loss_type == "sft":
-                    raise NotImplementedError
-                
-                else:
-                    questions_inputs = self.tokenizer(questions_text, return_tensors="pt", padding=True, padding_side="left")
-                    answers_inputs = self.tokenizer(answers_text_input, return_tensors="pt", padding=True)
-                    questions_inputs = {k: v.to(self.model.device) for k, v in questions_inputs.items()}
-                    answers_inputs = {k: v.to(self.model.device) for k, v in answers_inputs.items()}
+                questions_inputs = self.tokenizer(questions_text, return_tensors="pt", padding=True, padding_side="left")
+                questions_inputs = {k: v.to(self.model.device) for k, v in questions_inputs.items()}
 
-                    # repeat for generations_per_prompt
-                    questions_inputs = careful_repeat(questions_inputs, self.generations_per_prompt)
-                    answers_inputs = careful_repeat(answers_inputs, self.generations_per_prompt)
+                # repeat for generations_per_prompt
+                questions_inputs = careful_repeat(questions_inputs, self.generations_per_prompt)
 
-                    # generate
-                    x, generations, generation_metrics, _ = batch_generate_rnn(
-                        model=self.model,
-                        ref_model=self.ref_model,
-                        questions_inputs=questions_inputs,
-                        answers_inputs=answers_inputs,
-                        max_length=self.max_length,
-                        step_for_answer=self.step_for_answer,
-                        temperature=self.temperature,
-                        top_k=self.top_k,
-                        as_full_distribution=self.as_full_distribution,
-                        dot_by_dot=self.dot_by_dot,
-                        dot_by_dot_id=self.dot_by_dot_id,
-                        inject_answer_prompt=self.inject_answer_prompt,
-                        answer_prompt_ids=self.answer_prompt_ids,
-                        loss_type=self.loss_type,
-                        compute_everything=self.compute_everything,
-                    )
-                    generation_metrics = {f"gen/{k}": v for k, v in generation_metrics.items()}
+                # generate
+                x, (generations, patched_generations), generation_metrics = batch_generate_rnn(
+                    model=self.model,
+                    ref_model=self.ref_model,
+                    tokenizer=self.tokenizer,
+                    questions_inputs=questions_inputs,
+                    answers_text=answers_text,
+                    max_length=self.max_length,
+                    temperature=self.temperature,
+                    loss_type=self.loss_type,
+                )
+                generation_metrics = {f"gen/{k}": v for k, v in generation_metrics.items()}
 
-                    ### rewards
-                    rewards, normalized_rewards, decoded_generations, extracted_answers, reward_metrics = self.get_rewards(generations, answers_text)
-                    reward_metrics = {k if k == "REWARD" else f"reward/{k}": v for k, v in reward_metrics.items()}
+                ### rewards
+                rewards, normalized_rewards, decoded_generations, extracted_answers, reward_metrics = self.get_rewards(generations, answers_text)
+                reward_metrics = {k if k == "REWARD" else f"reward/{k}": v for k, v in reward_metrics.items()}
                     
                 # COMPUTE LOSS
                 with self.ctx: 
@@ -372,6 +318,13 @@ class Trainer:
                 else:
                     metrics = {**generation_metrics, **loss_metrics, **reward_metrics}
                     metrics_s = {k: v + metrics[k] for k, v in metrics_s.items()}
+
+                # cleanup
+                if not (self.rank == 0 and (i % 1 == 0 or i == self.max_iters - 1)):
+                    del generations, patched_generations, rewards, questions_text, answers_text, decoded_generations, extracted_answers
+                del x, normalized_rewards, questions_inputs, dataset_batch, generation_metrics, loss_metrics, reward_metrics
+                gc.collect()
+                torch.cuda.empty_cache()
 
             # UPDATE MODEL
             self.apply_update()
@@ -391,16 +344,18 @@ class Trainer:
                 print("-"*50)
                 for k in range(num_to_print):
                     print(f"EXAMPLE {k}: (REWARD={rewards[k].item():.4f}):")
-                    print(f"    QUESTION: {questions_text[k//self.generations_per_prompt]}")
-                    print(f"    GENERATION: {decoded_generations[k]}")
-                    print(f"    EXTRACTED ANSWER: {extracted_answers[k]}")
-                    print(f"    ANSWER: {answers_text[k//self.generations_per_prompt]}")
-                    print(f"    LENGTH: {lengths[k]}")
+                    print(f"              QUESTION: {questions_text[k//self.generations_per_prompt]}")
+                    print(f"            GENERATION: {decoded_generations[k]}")
+                    if patched_generations is not None:
+                        print(f"    PATCHED GENERATION: {patched_generations[k]}")
+                    print(f"       ANSWER, EXTRACTED ANSWER, MATCH: {answers_text[k//self.generations_per_prompt]}, {extracted_answers[k]}, {answers_text[k//self.generations_per_prompt] == extracted_answers[k]}")
+                    print(f"       LENGTH: {lengths[k]}")
                     print("-"*50)
                 print("\n\n")
 
-            # clenup
-            del x, normalized_rewards, generations
+                # clenup
+                del generations, patched_generations, rewards, questions_text, answers_text, decoded_generations, extracted_answers
+            del metrics_s, loss
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -425,7 +380,6 @@ def main(cfg):
 
 if __name__ == '__main__':
     main()
-
 
 
 # CUDA_VISIBLE_DEVICES=0 python run_full_single_gpu.py

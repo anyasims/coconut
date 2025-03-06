@@ -408,8 +408,10 @@ def batch_generate_rnn(
     generations_without_injection = torch.cat((generations_without_injection, next_token_ids), dim=1)
     generations = torch.cat((generations, next_token_ids), dim=1)
 
-    gen_per_token_logps = torch.gather(all_gen_logits, 2, generations_without_injection.to(torch.long).unsqueeze(-1)).squeeze(-1)
-    ref_per_token_logps = torch.gather(all_ref_logits, 2, generations_without_injection.to(torch.long).unsqueeze(-1)).squeeze(-1)
+    all_gen_logps = torch.nn.functional.log_softmax(all_gen_logits, dim=-1)
+    all_ref_logps = torch.nn.functional.log_softmax(all_ref_logits, dim=-1)
+    gen_per_token_logps = torch.gather(all_gen_logps, 2, generations_without_injection.to(torch.long).unsqueeze(-1)).squeeze(-1)
+    ref_per_token_logps = torch.gather(all_ref_logps, 2, generations_without_injection.to(torch.long).unsqueeze(-1)).squeeze(-1)
 
     eos_token_id = model.module.config.eos_token_id if dist.is_initialized() else model.config.eos_token_id
     eos_occurrences = (generations_without_injection == eos_token_id).int()
