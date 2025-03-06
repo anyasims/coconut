@@ -17,10 +17,7 @@ seed: 0
 
 loss:
   loss_type: pg # sft, pg, or logp
-  sft_include_cot: True
-  sft_predict_cot: True
   pg_normalization_type: grpo # grpo, rloo, or none
-  answer_prompt_coef: 0.0
   entropy_coef: 0.001
   kl_loss_coef: 0.001
 
@@ -29,12 +26,5 @@ loss:
 generation:
   generations_per_prompt: 4 # 4
   temperature: 1.0
-  top_k: null
   max_length: 1024
-  step_for_answer: null
-  inject_answer_prompt: False
-  as_full_distribution: False # False
-  dot_by_dot: False
-  compute_everything: False
-  predict_answer_prompt: False # False
 
