@@ -100,7 +100,7 @@ class Trainer:
             if self.loss_type == "pg":
                 run_name += f"-{self.pg_normalization_type}" if self.pg_normalization_type is not None else ""
             elif self.loss_type == "logp":
-                run_name += f"-TF" if self.logp_teacher_forcing else ""
+                run_name += f"-TF{self.logp_teacher_forcing}"
                 run_name += f"-no_eot{self.logp_steps_if_no_eot}"
             # training
             run_name += "-"
