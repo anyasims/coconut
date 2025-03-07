@@ -104,7 +104,7 @@ class Trainer:
             if self.loss_type == "pg":
                 run_name += f"-{self.pg_normalization_type}" if self.pg_normalization_type is not None else ""
             elif self.loss_type == "logp":
-                run_name += f"-TF" if self.logp_teacher_forcing else ""
+                run_name += f"-TF{self.logp_teacher_forcing}"
                 run_name += f"-no_eot{self.logp_steps_if_no_eot}"
             # training
             run_name += "-"
@@ -154,7 +154,7 @@ class Trainer:
             print(f"Gradient accumulation steps: {self.gradient_accumulation_steps}")
             print(f"Generations per prompt: {self.generations_per_prompt}")
             print(f"Per device prompt batch size: {self.per_device_prompt_batch_size}")
-            print(f"Dataset size: {self.dataset_size} (saller for debugging)")
+            print(f"Dataset size: {self.dataset_size} (smaller for debugging)")
             print(f"Lr: {cfg.lr}")
             print(f"-----------------------------------\n")
             print(f"---GENERATION CONFIG:")
@@ -162,7 +162,7 @@ class Trainer:
             print(f"Max length: {self.max_length}")
             if self.loss_type == "logp":
                 print(f"Logp teacher forcing: {self.logp_teacher_forcing}")
-                print(f"Logp steps if no EOT: {self.logp_steps_if_no_eot}")
+                print(f"Logp steps if no eot: {self.logp_steps_if_no_eot}")
             print(f"-----------------------------------\n")
             print(f"---LOSS CONFIG:")
             print(f"Loss type: {self.loss_type}")
@@ -216,7 +216,9 @@ class Trainer:
             answer_text = answers_text[i].replace(",", "")
             decoded_batch = self.tokenizer.batch_decode(generations[i])
             for j in range(self.generations_per_prompt):
-                decoded = decoded_batch[j].split(self.tokenizer.eos_token)[0]
+                decoded = decoded_batch[j]
+                if self.loss_type == "pg":
+                    decoded = decoded.split(self.tokenizer.eos_token)[0]
                 contains_answer_prompt_ij, extracted_answer = extract_solution(decoded)
                 contains_answer_prompt[i, j] = contains_answer_prompt_ij
                 contains_answer[i, j] = extracted_answer == answer_text
@@ -286,7 +288,7 @@ class Trainer:
 
     def run_training_loop(self, num_iters=None):
         """Run the training loop"""
-        start_time = time.time()
+        train_start_time = time.time()
         num_iters = self.max_iters if num_iters is None else num_iters
         for i in tqdm.tqdm(range(num_iters), desc="Training"):
             self.train_loader.sampler.set_epoch(i) # shuffling every iter for now to avoid the effect of epochs
@@ -309,6 +311,7 @@ class Trainer:
                 questions_inputs = careful_repeat(questions_inputs, self.generations_per_prompt)
 
                 # generate
+                start_time = time.time()
                 x, generations, generation_metrics = batch_generate_rnn(
                     model=self.model,
                     ref_model=self.ref_model,
@@ -322,16 +325,21 @@ class Trainer:
                     logp_steps_if_no_eot=self.logp_steps_if_no_eot,
                 )
                 generation_metrics = {f"gen/{k}": v for k, v in generation_metrics.items()}
+                gen_time = time.time()-start_time
+                generation_metrics["gen/time"] = torch.tensor(gen_time, device=self.device)
 
                 ### rewards
                 rewards, normalized_rewards, decoded_generations, extracted_answers, reward_metrics = self.get_rewards(generations, answers_text)
                 reward_metrics = {k if k == "REWARD" else f"reward/{k}": v for k, v in reward_metrics.items()}
                     
                 # COMPUTE LOSS
+                start_time = time.time()
                 with self.ctx: 
                     loss, loss_metrics = self.get_loss(x, normalized_rewards)
                     self.scaler.scale(loss).backward()
                 loss_metrics = {f"loss/{k}": v for k, v in loss_metrics.items()}
+                loss_time = time.time()-start_time
+                loss_metrics["loss/time"] = torch.tensor(loss_time, device=self.device)
 
                 # UPDATE METRICS
                 if j == 0:
@@ -340,10 +348,25 @@ class Trainer:
                     metrics = {**generation_metrics, **loss_metrics, **reward_metrics}
                     metrics_s = {k: v + metrics[k] for k, v in metrics_s.items()}
 
+                if j % 1 == 0 and self.rank == 0:
+                    # print
+                    print("-"*50)
+                    print(f"Iter {i+1}, Accumulation step {j+1}/{self.gradient_accumulation_steps}")
+                    print(f"Generation time: {gen_time:.1f}s")
+                    print(f"Loss time: {loss_time:.1f}s")
+                    print("-"*50)
+                    print(f"              QUESTION: {questions_text[0]}")
+                    print(f"            GENERATION: {decoded_generations[0]}")
+                    print(f"                ANSWER: {answers_text[0]}")
+                    print(f"      EXTRACTED ANSWER: {extracted_answers[0]}")
+                    print(f"                 MATCH: --- {answers_text[0] == extracted_answers[0]}")
+                    print(f"                LENGTH: {(generations[0] != self.tokenizer.eos_token_id).int().sum().item()}")
+                    print(f"                REWARD: {rewards[0]:.2f}")
+                    print("-"*50)
+                    print("\n")
+
                 # cleanup
-                if not (self.rank == 0 and (i % 1 == 0 or i == self.max_iters - 1)):
-                    del generations, rewards, questions_text, answers_text, decoded_generations, extracted_answers
-                del x, normalized_rewards, questions_inputs, dataset_batch, generation_metrics, loss_metrics, reward_metrics
+                del x, normalized_rewards, questions_inputs, dataset_batch, generation_metrics, loss_metrics, reward_metrics, generations, rewards, questions_text, answers_text, decoded_generations, extracted_answers
                 gc.collect()
                 torch.cuda.empty_cache()
 
@@ -358,35 +381,14 @@ class Trainer:
             param_metrics = get_model_param_stats(self.model, self.ref_model)
             metrics_s.update({f"params/{k}": v for k, v in param_metrics.items()})
             metrics_s.update({"iter": i, "lr": self.optimizer.param_groups[0]["lr"]})
-            if self.rank == 0:
-                if self.use_wandb:
-                    wandb.log(metrics_s)
-                if i % 1 == 0 or i == self.max_iters - 1:
-                    lengths = (torch.cumsum((generations == self.tokenizer.eos_token_id).int(), dim=1) == 0).int().sum(dim=-1)
-    
-                    print(f"({metrics_s})\n\n", "-"*50)
-                    num_to_print = min(3, self.per_device_batch_size)
-                    print("-"*50)
-                    for k in range(num_to_print):
-                        print(f"EXAMPLE {k}: (REWARD={rewards[k].item():.4f}):")
-                        print(f"              QUESTION: {questions_text[k//self.generations_per_prompt]}")
-                        print(f"            GENERATION: {decoded_generations[k]}")
-                        print(f"                ANSWER: {answers_text[k//self.generations_per_prompt]}")
-                        print(f"      EXTRACTED ANSWER: {extracted_answers[k]}")
-                        print(f"                 MATCH: --- {answers_text[k//self.generations_per_prompt] == extracted_answers[k]}")
-                        print(f"                LENGTH: {lengths[k]}")
-                        print("-"*50)
-                    print(f"iter {i}: REWARD={metrics_s['REWARD']:.2f}\n", "-"*50)
-                    print("\n\n")
-
-                    # clenup
-                    del generations, rewards, questions_text, answers_text, decoded_generations, extracted_answers
-                del metrics_s, loss
-                gc.collect()
-                torch.cuda.empty_cache()
+            if self.use_wandb and self.rank == 0:
+                wandb.log(metrics_s)
+            del metrics_s, loss
+            gc.collect()
+            torch.cuda.empty_cache()
 
         if self.rank == 0:
-            print(f"Training time: {time.time()-start_time:.1f}s")
+            print(f"Training time: {time.time()-train_start_time:.1f}s")
             print("Training complete")
             wandb.finish()
             

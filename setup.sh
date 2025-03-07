@@ -35,6 +35,7 @@ export PYTHONPATH=$PYTHONPATH:/home/anya/Documents/llm_tiny_ideas/coconut-outer/
 
 # ssh-copy-id -i ~/.ssh/id_rsa.pub anya@flair-node-12.eng.ox.ac.uk
 # scp -r -v /home/anya/Documents/llm_tiny_ideas/coconut-outer/coconut/checkpoints flair-node-12.eng.ox.ac.uk:/homes/80/anya/Documents/llm_tiny_ideas/coconut-outer/coconut/
+# scp -r -v ~/Downloads/wandb_export_2025-03-07T14_53_47.869+00_00.csv flair-node-05.robots.ox.ac.uk:/homes/80/anya/Documents/llm_tiny_ideas/coconut-outer/coconut/outputs/uploaded_from_wandb/
 
 
 ## For running:

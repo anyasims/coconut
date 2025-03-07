@@ -56,6 +56,9 @@ def supervise_answer(
             prev_logits = answer_logits[:, i:i+1]
             next_input = torch.nn.functional.softmax(prev_logits / temperature, dim=-1)
             next_input = teacher_forcing * target_one_hots[:, i:i+1] + (1.0 - teacher_forcing) * next_input
+            # print(f"\n{i=}/{target_tokens.shape[1]-1}")
+            # print(f"prev prediction: {tokenizer.decode(torch.argmax(prev_logits, dim=-1).squeeze().tolist())}")
+            # print(f"next input: {tokenizer.decode(torch.argmax(next_input, dim=-1).squeeze().tolist())}")
 
             logits, past_key_values = step(model,
                 next_input=next_input,
@@ -66,6 +69,7 @@ def supervise_answer(
                 )
             answer_inputs = torch.cat((answer_inputs, next_input), dim=1)
             answer_logits = torch.cat((answer_logits, logits), dim=1)
+            # print(f"next prediction: {tokenizer.decode(torch.argmax(logits, dim=-1).squeeze().tolist())}")
 
         answer_logps = torch.nn.functional.log_softmax(answer_logits, dim=-1)
         per_token_logps = torch.gather(answer_logps, 2, target_tokens.to(torch.long).unsqueeze(-1)).squeeze(-1)
@@ -76,6 +80,18 @@ def supervise_answer(
         all_generations = torch.cat((all_generations, supervised_answer_generations), dim=1)
         all_inputs = torch.cat((torch.nn.functional.softmax(all_logits[:, :-1] / temperature, dim=-1), answer_inputs), dim=1)
         all_logits = torch.cat((all_logits, answer_logits), dim=1)
+
+        # print(f"Supervised generation fisnished:")
+        # ins = [tokenizer.decode([int(i)]) for i in torch.argmax(answer_inputs, dim=-1)[0].tolist()]
+        # outs = [tokenizer.decode([int(i)]) for i in supervised_answer_generations[0].tolist()]
+        # tars = [tokenizer.decode([int(i)]) for i in target_tokens[0].tolist()]
+        # for i, (in_, out_, tar_) in enumerate(zip(ins, outs, tars)):
+        #     print(f"{i=},               {in_}             {out_}               {tar_}")
+        # print(f"DECODED: {tokenizer.batch_decode(supervised_answer_generations)}")
+        # print(f"DECODED SKIP: {tokenizer.batch_decode(supervised_answer_generations, skip_special_tokens=True)}")
+        # print(f"DECODED NO SKIP: {tokenizer.batch_decode(supervised_answer_generations, skip_special_tokens=False)}")
+        # print(f"ALL DECODED: {tokenizer.batch_decode(all_generations)}")
+
 
         metrics = {}
         metrics["answer_logps"] = answer_logp
@@ -94,7 +110,9 @@ def extract_solution(solution_str):
     solution = re.search(r"Answer: (\-?[0-9\.\,]+)", solution_str)
     if solution is None:
         return (contains_answer_prompt, None)
-    extracted_answer = solution.group(1).replace(',', '')
+    extracted_answer = solution.group(1).replace(',', '').replace('_', '').replace(' ', '')
+    # Remove a trailing period (but keep periods in the middle)
+    extracted_answer = re.sub(r'\.$', '', extracted_answer)
     return (contains_answer_prompt, extracted_answer)
 
 def careful_repeat(data, num_repeats):
@@ -224,7 +242,6 @@ def batch_generate_rnn_full_dist(
         teacher_forcing=0.5,
         steps_if_no_eot=100,
     ):
-    assert teacher_forcing, f"Only teacher forcing is supported for now, {teacher_forcing=}"
     metrics = {}
     device = model.device
     assert device.type == "cuda", f"{model.device=}"
@@ -235,7 +252,8 @@ def batch_generate_rnn_full_dist(
     assert batch_size == 1, f"{batch_size=}"
     vocab_size = model.module.config.vocab_size if dist.is_initialized() else model.config.vocab_size
 
-    attention_mask = torch.ones((batch_size, max_length), device=device)
+    answer_buffer = 20
+    attention_mask = torch.ones((batch_size, max_length+answer_buffer), device=device)
     attention_mask[:, :prompt_length] = questions_inputs["attention_mask"]
     position_ids = (torch.cumsum(attention_mask, dim=1) - 1)
 
