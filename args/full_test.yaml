@@ -1,6 +1,6 @@
 # need 4 gpus
 
-dataset: gsm8k
+dataset: svamp
 # base_model: Qwen/Qwen2.5-0.5b
 base_model: Qwen/Qwen2.5-0.5b
 
@@ -10,7 +10,7 @@ wandb_project: coconut
 
 max_iters: 3000
 total_batch_size: 1024
-per_device_batch_size: 8 # 4
+per_device_batch_size: 4 # 4
 lr: 1e-6
 dataset_size: null # for debugging to overfit to a small dataset
 seed: 0
@@ -18,6 +18,7 @@ seed: 0
 loss:
   loss_type: pg # sft, pg, or logp
   pg_normalization_type: grpo # grpo, rloo, or none
+  answer_prompt_coef: 0.1
   entropy_coef: 0.001
   kl_loss_coef: 0.001
 
@@ -26,5 +27,9 @@ loss:
 generation:
   generations_per_prompt: 4 # 4
   temperature: 1.0
-  max_length: 1024
+  max_length: 512
+  logp_steps_if_no_eot: 300
+  logp_teacher_forcing: 0.5
 
+# CUDA_VISIBLE_DEVICES=3,4,5,6 torchrun --nnodes 1 --nproc_per_node 4 run_full_ddp.py
+# CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nnodes 1 --nproc_per_node 8 run_full_ddp.py per_device_batch_size=1 loss.loss_type=logp generation.generations_per_prompt=1 generation.temperature=0.1 generation.generations_per_prompt=1
