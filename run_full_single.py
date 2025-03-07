@@ -48,9 +48,10 @@ class Trainer:
         train_dataset = dataset[split_name]
         if self.dataset_size is not None:
             train_dataset = train_dataset.select(range(self.dataset_size))
-        print(f"Dataset: {cfg.dataset}")
-        print(f"Split: {split_name}")
-        print(f"Dataset size: {len(train_dataset)}")
+        if self.rank == 0:
+            print(f"Dataset: {cfg.dataset}")
+            print(f"Split: {split_name}")
+            print(f"Dataset size: {len(train_dataset)}")
         self.train_dataset = train_dataset
 
         self.ctx = self._setup_ctx()
