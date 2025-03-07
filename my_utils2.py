@@ -1,6 +1,101 @@
+import re
 import torch
 import torch.distributed as dist
 
+def supervise_answer(
+        model,
+        logits,
+        all_logits,
+        all_generations,
+        past_key_values,
+        answers_text,
+        tokenizer,
+        temperature,
+        attention_mask,
+        position_ids,
+        prompt_length,
+        max_length_reached=False,
+        steps_if_no_eot=100,
+        teacher_forcing=0.5
+        ):
+
+    batch_size = logits.shape[0]
+    assert batch_size == 1, f"{batch_size=}"
+    gen = torch.argmax(logits, dim=-1).item()
+    answer_prompt_generated = gen in [tokenizer.encode(f"Answer")[0], tokenizer.encode(f" Answer")[0]]
+    eot_generated = gen == tokenizer.eos_token_id
+    if max_length_reached or answer_prompt_generated or eot_generated:
+        if max_length_reached:
+            target_tokens = tokenizer.encode(f"... Answer: {answers_text[0]}.") + [tokenizer.eos_token_id]
+            answer_inputs = torch.nn.functional.softmax(all_logits[:, steps_if_no_eot-1:steps_if_no_eot] / temperature, dim=-1)
+            answer_logits = all_logits[:, steps_if_no_eot:steps_if_no_eot+1]
+            past_key_values = [
+                (kv[0][:, :, :prompt_length+steps_if_no_eot], kv[1][:, :, :prompt_length+steps_if_no_eot])
+                for kv in past_key_values
+            ]
+            all_generations = all_generations[:, :steps_if_no_eot]
+            all_logits = all_logits[:, :steps_if_no_eot]
+        else:
+            answer_inputs = torch.nn.functional.softmax(all_logits[:, -1:] / temperature, dim=-1)
+            answer_logits = logits
+            if gen in [tokenizer.encode(f"Answer")[0], tokenizer.encode(f" Answer")[0]]:
+                target_tokens = [gen] + tokenizer.encode(f": {answers_text[0]}.") + [tokenizer.eos_token_id]
+            elif gen == tokenizer.eos_token_id:
+                ends_with_space = tokenizer.decode(all_generations[0, -2]).endswith(" ")
+                answer_prompt = "Answer" if ends_with_space else " Answer"
+                target_tokens = tokenizer.encode(f"{answer_prompt}: {answers_text[0]}.") + [tokenizer.eos_token_id]
+            else:
+                raise ValueError(f"Should not reach here, {gen=}")
+            
+        target_tokens = torch.tensor(target_tokens, device=model.device).unsqueeze(0)
+        vocab_size = model.module.config.vocab_size if dist.is_initialized() else model.config.vocab_size
+        target_one_hots = torch.nn.functional.one_hot(target_tokens, num_classes=vocab_size).float()
+        prev_seq_length = past_key_values[0][0].shape[2]
+
+        for i in range(target_tokens.shape[1]-1):
+            prev_logits = answer_logits[:, i:i+1]
+            next_input = torch.nn.functional.softmax(prev_logits / temperature, dim=-1)
+            next_input = teacher_forcing * target_one_hots[:, i:i+1] + (1.0 - teacher_forcing) * next_input
+
+            logits, past_key_values = step(model,
+                next_input=next_input,
+                attention_mask=attention_mask[:, :prev_seq_length+i+1],
+                position_ids=position_ids[:, prev_seq_length+i:prev_seq_length+i+1],
+                past_key_values=past_key_values,
+                as_full_distribution=True,
+                )
+            answer_inputs = torch.cat((answer_inputs, next_input), dim=1)
+            answer_logits = torch.cat((answer_logits, logits), dim=1)
+
+        answer_logps = torch.nn.functional.log_softmax(answer_logits, dim=-1)
+        per_token_logps = torch.gather(answer_logps, 2, target_tokens.to(torch.long).unsqueeze(-1)).squeeze(-1)
+        answer_logp = per_token_logps.sum()
+
+        # for rest of function
+        supervised_answer_generations = torch.argmax(answer_logits, dim=-1)
+        all_generations = torch.cat((all_generations, supervised_answer_generations), dim=1)
+        all_inputs = torch.cat((torch.nn.functional.softmax(all_logits[:, :-1] / temperature, dim=-1), answer_inputs), dim=1)
+        all_logits = torch.cat((all_logits, answer_logits), dim=1)
+
+        metrics = {}
+        metrics["answer_logps"] = answer_logp
+        metrics["answer_perplexity"] = torch.exp(-per_token_logps.mean())
+        metrics["max_length_reached"] = torch.tensor(max_length_reached, device=model.device, dtype=torch.float)
+        metrics["answer_prompt_generated"] = torch.tensor(answer_prompt_generated, device=model.device, dtype=torch.float)
+        metrics["eot_generated"] = torch.tensor(eot_generated, device=model.device, dtype=torch.float)
+        metrics["tokens_correct"] = (supervised_answer_generations == target_tokens).float().mean()
+
+        return answer_logp, all_generations, all_inputs, all_logits, metrics
+    else:
+        return None
+
+def extract_solution(solution_str):
+    contains_answer_prompt = "Answer:" in solution_str
+    solution = re.search(r"Answer: (\-?[0-9\.\,]+)", solution_str)
+    if solution is None:
+        return (contains_answer_prompt, None)
+    extracted_answer = solution.group(1).replace(',', '')
+    return (contains_answer_prompt, extracted_answer)
 
 def careful_repeat(data, num_repeats):
     batch_size = data[list(data.keys())[0]].shape[0]
@@ -92,14 +187,14 @@ def batch_generate_with_method_low_memory(
     assert x[1].requires_grad == False, f"{x[1].requires_grad=}"
     assert x[2].requires_grad == True, f"{x[2].requires_grad=}"
 
-    return x, (generations, None), metrics
+    return x, generations, metrics
 
 
 def step(model, next_input, attention_mask, position_ids, past_key_values, as_full_distribution=False):
     batch_size = next_input.shape[0]
     next_seq_length = next_input.shape[1]
     prev_seq_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
-    assert position_ids.shape == (batch_size, next_seq_length), f"{position_ids.shape=}"
+    assert position_ids.shape == (batch_size, next_seq_length), f"{position_ids.shape=}, {next_seq_length=}"
     assert attention_mask.shape == (batch_size, prev_seq_length+next_seq_length), f"{attention_mask.shape=}, {prev_seq_length=}, {next_seq_length=}"
     if as_full_distribution:
         # next_input is a distribution over the vocabulary (batch_size, next_seq_length, vocab_size)
@@ -126,7 +221,10 @@ def batch_generate_rnn_full_dist(
         answers_text,
         max_length=200,
         temperature=1.0,
+        teacher_forcing=0.5,
+        steps_if_no_eot=100,
     ):
+    assert teacher_forcing, f"Only teacher forcing is supported for now, {teacher_forcing=}"
     metrics = {}
     device = model.device
     assert device.type == "cuda", f"{model.device=}"
@@ -155,9 +253,6 @@ def batch_generate_rnn_full_dist(
     all_generations = torch.zeros((batch_size, 0), device=device, dtype=torch.int)
 
     ### COT FORWARD PASSES
-    eot_idx = None
-    buffer_counter = None
-    buffer_length = 5
     for t in range(max_length-prompt_length):
         logits, past_key_values = step(model,
             next_input=next_input,
@@ -166,76 +261,39 @@ def batch_generate_rnn_full_dist(
             past_key_values=past_key_values,
             as_full_distribution=False if t == 0 else True,
             )
-        next_input = torch.nn.functional.softmax(logits, dim=-1) / temperature
+        supervised_output = supervise_answer(
+                model=model,
+                logits=logits,
+                all_logits=all_logits,
+                all_generations=all_generations,
+                past_key_values=past_key_values,
+                answers_text=answers_text,
+                tokenizer=tokenizer,
+                temperature=temperature,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                prompt_length=prompt_length,
+                max_length_reached=t == max_length-prompt_length-1,
+                steps_if_no_eot=steps_if_no_eot,
+                teacher_forcing=teacher_forcing,
+            )
+        if supervised_output is not None:
+            answer_logp, all_generations, all_inputs, all_logits, supervised_metrics = supervised_output
+            break
+
+        next_input = torch.nn.functional.softmax(logits / temperature, dim=-1)
         next_generation = torch.argmax(logits, dim=-1)
         all_logits = torch.cat((all_logits, logits), dim=1)
         all_generations = torch.cat((all_generations, next_generation), dim=1)
 
-        if eot_idx is None and next_generation.squeeze().item() == model.config.eos_token_id:
-            eot_idx = t
-            buffer_counter = 0
-        if buffer_counter is not None:
-            buffer_counter += 1
-        if buffer_counter == buffer_length:
-            break
-
-    ### FIND ANSWER
-    assert batch_size == 1, f"{batch_size=}"
-    generations_for_search = all_generations.squeeze(0)[-buffer_length:]
-    answer_text = answers_text[0]
-    answer_search_tokens = tokenizer.encode("0123456789")
-    assert len(answer_search_tokens) == 10, f"{answer_search_tokens=}"
-    answer_search_tokens = torch.tensor(answer_search_tokens, device=device)
-    is_answer_token = torch.isin(generations_for_search, answer_search_tokens).int()
-    if is_answer_token.sum() == 0:
-        tokenized_answer = tokenizer.encode(f" ...Answer: {answer_text}.")
-        start_idx = t - len(tokenized_answer)
-        end_idx = t # exclusive
-    else:
-        tokenized_answer = tokenizer.encode(answer_text)
-        start_end_idxs = is_answer_token[1:] - is_answer_token[:-1]
-        # ^ 1 if the token is just before the start of an answer, -1 if it's the end of an answer, 0 otherwise,
-        # example:
-        # [0 0 0 0 0 0 0 1 1 1  1 0 0 0 0 0 1  1 0]
-        # [0 0 0 0 0 0 1 1 1 1  0 0 0 0 0 1 1  0] -
-        # [0 0 0 0 0 0 0 1 1 1  1 0 0 0 0 0 1  1] =
-        # [0 0 0 0 0 0 1 0 0 0 -1 0 0 0 0 1 0 -1]
-        start_idxs = (start_end_idxs == 1).nonzero(as_tuple=True)[0]
-        if start_idxs.numel() == 0:
-            start_idx = 0
-        else:
-            start_idx = start_idxs[-1] + 1
-        end_idx = start_idx + len(tokenized_answer)
-    eot_idx = max(t, end_idx)
-    patched_all_generations = all_generations.clone()
-    print(f"{is_answer_token.sum().item()=}, {start_idx.item()=}, {end_idx.item()=}, {eot_idx=}, {t=}, {len(tokenized_answer)=}, {tokenized_answer=}")
-    patched_all_generations[start_idx:end_idx] = torch.tensor(tokenized_answer)
-    patched_all_generations[eot_idx] = model.config.eos_token_id
-    mask = torch.zeros_like(all_generations)
-    mask[start_idx:end_idx] = 1
-    mask[eot_idx] = 1
-
-    patched_all_generations = patched_all_generations.unsqueeze(0).to(device)
-    mask = mask.unsqueeze(0).to(device)
-
-    all_logps = torch.nn.functional.log_softmax(all_logits, dim=-1)
-    per_token_logps = torch.gather(all_logps, 2, patched_all_generations.to(torch.long).unsqueeze(-1)).squeeze(-1)
-    answer_logps = (per_token_logps * mask).sum()
-
-    with torch.no_grad():
-        answer_perplexity = torch.exp(-answer_logps / mask.sum())
-    metrics["answer_logps"] = answer_logps
-    metrics["answer_perplexity"] = answer_perplexity
-    metrics["length_to_eot"] = t
-    metrics["length_eot_to_eot_predicted"] = eot_idx - t
-    metrics["length_answer_to_eot"] = t - end_idx
+    
 
     ### REFERENCE MODEL
     with torch.no_grad():
         # make prompt_input_ids into 1-hot vectors
         prompt_inputs = torch.nn.functional.one_hot(questions_inputs["input_ids"], num_classes=vocab_size).float()
-        gen_inputs = all_logps.exp() / temperature
-        inputs = torch.cat((prompt_inputs, gen_inputs[:, :-1]), dim=1)
+        inputs = torch.cat((prompt_inputs, all_inputs), dim=1)
+
         ref_logits, _ = step(ref_model,
             next_input=inputs,
             attention_mask=attention_mask[:, :inputs.shape[1]],
@@ -245,18 +303,25 @@ def batch_generate_rnn_full_dist(
             )
         ref_logits = ref_logits[:, prompt_length-1:]
         all_ref_logps = torch.nn.functional.log_softmax(ref_logits, dim=-1)
-    full_kl = (all_logps.exp() * (all_logps - all_ref_logps)).sum(-1).mean(-1)
+
+    ### ENTROPY AND KL
+    all_logps = torch.nn.functional.log_softmax(all_logits, dim=-1)
     entropy = torch.logsumexp(all_logits, dim=-1) - torch.sum(all_logps.exp() * all_logits, dim=-1).mean(-1)
+    full_kl = (all_logps.exp() * (all_logps - all_ref_logps)).sum(-1).mean(-1)
 
-    metrics["full_kl"] = full_kl
+    metrics["full_kl"] = full_kl.mean()
     metrics["entropy"] = entropy.mean()
+    metrics["prompt_length"] = torch.tensor(prompt_length, device=device)
+    metrics["cot_length"] = torch.tensor(all_generations.shape[1], device=device)
+    metrics["total_length"] = torch.tensor(prompt_length + all_generations.shape[1], device=device)
+    metrics.update(supervised_metrics)
 
-    x = (answer_logps, entropy, full_kl)
+    x = (answer_logp, entropy, full_kl)
     assert x[0].requires_grad == True, f"{x[0].requires_grad=}"
     assert x[1].requires_grad == True, f"{x[1].requires_grad=}"
     assert x[2].requires_grad == True, f"{x[2].requires_grad=}"
 
-    return x, (all_generations, patched_all_generations), metrics
+    return x, all_generations, metrics
 
 
 # @torch.no_grad()
@@ -269,6 +334,8 @@ def batch_generate_rnn(
         max_length=200,
         temperature=1.0,
         loss_type="pg",
+        logp_teacher_forcing=False,
+        logp_steps_if_no_eot=100,
     ):
     if loss_type == "pg":
         return batch_generate_with_method_low_memory(
@@ -287,6 +354,8 @@ def batch_generate_rnn(
             answers_text=answers_text,
             max_length=max_length,
             temperature=temperature,
+            teacher_forcing=logp_teacher_forcing,
+            steps_if_no_eot=logp_steps_if_no_eot,
         )
     else:
         raise ValueError(f"Invalid loss type: {loss_type}")
