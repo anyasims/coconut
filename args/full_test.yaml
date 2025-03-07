@@ -33,3 +33,5 @@ generation:
 
 # CUDA_VISIBLE_DEVICES=3,4,5,6 torchrun --nnodes 1 --nproc_per_node 4 run_full_ddp.py
 # CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nnodes 1 --nproc_per_node 8 run_full_ddp.py per_device_batch_size=1 loss.loss_type=logp generation.generations_per_prompt=1 generation.temperature=0.1 generation.generations_per_prompt=1
+
+# generation.max_length=200 generation.logp_steps_if_no_eot=20
