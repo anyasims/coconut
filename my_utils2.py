@@ -24,7 +24,8 @@ def supervise_answer(
     gen = torch.argmax(logits, dim=-1).item()
     answer_prompt_generated = gen in [tokenizer.encode(f"Answer")[0], tokenizer.encode(f" Answer")[0]]
     eot_generated = gen == tokenizer.eos_token_id
-    if max_length_reached or answer_prompt_generated or eot_generated:
+    min_length_reached = all_generations.shape[1] >= steps_if_no_eot
+    if max_length_reached or (answer_prompt_generated and min_length_reached) or eot_generated:
         if max_length_reached:
             target_tokens = tokenizer.encode(f"... Answer: {answers_text[0]}.") + [tokenizer.eos_token_id]
             answer_inputs = torch.nn.functional.softmax(all_logits[:, steps_if_no_eot-1:steps_if_no_eot] / temperature, dim=-1)
@@ -98,6 +99,7 @@ def supervise_answer(
         metrics["answer_perplexity"] = torch.exp(-per_token_logps.mean())
         metrics["max_length_reached"] = torch.tensor(max_length_reached, device=model.device, dtype=torch.float)
         metrics["answer_prompt_generated"] = torch.tensor(answer_prompt_generated, device=model.device, dtype=torch.float)
+        metrics["min_length_reached"] = torch.tensor(min_length_reached, device=model.device, dtype=torch.float)
         metrics["eot_generated"] = torch.tensor(eot_generated, device=model.device, dtype=torch.float)
         metrics["tokens_correct"] = (supervised_answer_generations == target_tokens).float().mean()
 
@@ -330,7 +332,7 @@ def batch_generate_rnn_full_dist(
     metrics["full_kl"] = full_kl.mean()
     metrics["entropy"] = entropy.mean()
     metrics["prompt_length"] = torch.tensor(prompt_length, device=device)
-    metrics["cot_length"] = torch.tensor(all_generations.shape[1], device=device)
+    metrics["length"] = torch.tensor(all_generations.shape[1], device=device)
     metrics["total_length"] = torch.tensor(prompt_length + all_generations.shape[1], device=device)
     metrics.update(supervised_metrics)
 
