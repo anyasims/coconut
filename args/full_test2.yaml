@@ -1,0 +1,29 @@
+# need 4 gpus
+
+dataset: svamp
+base_model: Qwen/Qwen2.5-0.5b
+
+use_wandb: True
+run_name_prefix: "RUNS0"
+wandb_project: coconut
+
+max_iters: 3000
+total_batch_size: 1024
+per_device_batch_size: 4 # 4
+lr: 1e-6
+dataset_size: null # for debugging to overfit to a small dataset
+seed: 0
+
+generations_per_prompt: 4
+normalization_type:  grpo # grpo, rloo, or none
+cot_length: 100
+as_full_distribution: False
+temperature: 1.0
+teacher_forcing: 1.0
+cot_reward: "binary" # "probability", "none"
+
+entropy_coef: 0.001
+kl_loss_coef: 0.001
+kl_type: "per_token" # "per_token", "full"
+
+
