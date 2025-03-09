@@ -17,7 +17,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
-from my_utils2 import careful_repeat, batch_generate_rnn, get_model_param_stats, extract_solution
+from my_utils import careful_repeat, batch_generate_rnn, get_model_param_stats, extract_solution
 
 class Trainer:
     def __init__(self, cfg) -> None:

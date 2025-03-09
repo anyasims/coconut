@@ -14,7 +14,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import DatasetDict
 from torch.utils.data import DataLoader
 
-from my_utils2 import careful_repeat, batch_generate_rnn, get_model_param_stats, extract_solution
+from my_utils import careful_repeat, batch_generate_rnn, get_model_param_stats, extract_solution
 
 class Trainer:
     def __init__(self, cfg) -> None:
