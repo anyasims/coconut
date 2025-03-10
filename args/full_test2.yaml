@@ -1,7 +1,5 @@
-# need 4 gpus
-
-dataset: svamp
 base_model: Qwen/Qwen2.5-0.5b
+dataset: svamp
 
 use_wandb: True
 run_name_prefix: "RUNS0"
@@ -20,10 +18,11 @@ cot_length: 100
 as_full_distribution: False
 temperature: 1.0
 teacher_forcing: 1.0
-cot_reward: "binary" # "probability", "none"
+reward_type: "answer_generated" # "answer_generated", "answer_prob"
+answer_prompt: "....Answer: "
 
-entropy_coef: 0.001
-kl_loss_coef: 0.001
 kl_type: "per_token" # "per_token", "full"
+kl_loss_coef: 0.001
+entropy_coef: 0.001
 
 
