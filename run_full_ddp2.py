@@ -13,17 +13,20 @@ from omegaconf import OmegaConf
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import DatasetDict
 from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 from my_utils2 import get_generations, get_model_param_stats
 
 class Trainer:
     def __init__(self, cfg) -> None:
-        self.world_size = torch.cuda.device_count()
-        self.rank = 0 # dummy for now
-        self.local_rank = None
+        self.world_size = int(os.environ["WORLD_SIZE"])
+        self.rank = int(os.environ["RANK"])
+        self.local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(self.local_rank)
         assert torch.cuda.is_available(), "CUDA not available"
-        assert self.world_size == 1, "Only single GPU training is supported"
-        self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        self.device = torch.device("cuda", self.local_rank)
 
         # config
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.base_model)
@@ -32,8 +35,8 @@ class Trainer:
         # model
         model = AutoModelForCausalLM.from_pretrained(cfg.base_model).to(self.device)
         ref_model = AutoModelForCausalLM.from_pretrained(cfg.base_model).to(self.device)
-        self.model=model
-        self.ref_model=ref_model
+        self.model = DDP(model, device_ids=[self.local_rank])
+        self.ref_model = DDP(ref_model, device_ids=[self.local_rank])
         for param in self.ref_model.parameters():
             param.requires_grad = False
 
@@ -54,7 +57,8 @@ class Trainer:
             print(f"Dataset: {cfg.dataset}")
             print(f"Split: {split_name}")
             print(f"Dataset size: {len(train_dataset)}")
-        self.train_dataset = train_dataset
+        train_sampler = DistributedSampler(train_dataset, num_replicas=self.world_size, rank=self.rank, shuffle=True)
+        self.train_loader = DataLoader(train_dataset, batch_size=self.per_device_prompt_batch_size, sampler=train_sampler)
 
         self.ctx = self._setup_ctx()
 
@@ -244,15 +248,16 @@ class Trainer:
         train_start_time = time.time()
         num_iters = self.max_iters if num_iters is None else num_iters
         for i in tqdm.tqdm(range(num_iters), desc="Training"):
+            self.train_loader.sampler.set_epoch(i) # shuffling every iter for now to avoid the effect of epochs
+            data_iter = iter(self.train_loader)
+
             # GRADIENT ACCUMULATION
             for j in tqdm.tqdm(range(self.gradient_accumulation_steps), desc="Gradient accumulation", disable=True):
             
                 # GENERATE ROLLOUTS
                 start_time = time.time()
                 self.model.eval()
-                # sample batch randomly from the dataset
-                indices = random.sample(range(len(self.train_dataset)), self.per_device_prompt_batch_size)
-                dataset_batch = self.train_dataset.select(indices)
+                dataset_batch = next(data_iter)
                 questions_text = dataset_batch["question"]
                 # cot_text = dataset_batch["reasoning"]
                 answers_text = dataset_batch["answer"]
@@ -334,6 +339,8 @@ class Trainer:
 
             # LOG
             metrics_s = {k: v / self.gradient_accumulation_steps for k, v in metrics_s.items()}
+            for k, v in metrics_s.items():
+                dist.all_reduce(v, op=dist.ReduceOp.SUM)
             metrics_s = {k: v.item() / self.world_size for k, v in metrics_s.items()}
             param_metrics = get_model_param_stats(self.model, self.ref_model)
             metrics_s.update({f"params/{k}": v for k, v in param_metrics.items()})
@@ -359,12 +366,16 @@ class Trainer:
 
 @hydra.main(config_path="args", config_name="full_test2", version_base=None)
 def main(cfg):
+    dist.init_process_group(backend="nccl")
     trainer = Trainer(cfg)
     trainer.train()
+    dist.barrier()
+    dist.destroy_process_group()
 
 
 if __name__ == '__main__':
     main()
 
 
-# CUDA_VISIBLE_DEVICES=0 python run_full_single2.py use_wandb=False
+# CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 run_full_ddp2.py use_wandb=False
+# CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 run_full_ddp2.py use_wandb=False
