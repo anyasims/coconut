@@ -1,0 +1,39 @@
+base_model: Qwen/Qwen2.5-0.5b
+dataset: svamp_hash
+
+use_wandb: True
+run_name_prefix: "RUNS3"
+wandb_project: coconut
+
+max_iters: 3000
+total_batch_size: 64
+per_device_batch_size: 4 # 4
+lr: 1e-6
+dataset_size: null # for debugging to overfit to a small dataset
+seed: 0
+
+generations_per_prompt: 4
+normalization_type:  grpo # grpo, rloo, or null
+max_new_tokens: 512
+temperature: 1.0
+
+kl_type: "sample" # "sample", "full"
+kl_coef: 0.001
+entropy_coef: 0.001
+
+reward_type: "binary" # "binary", "prob",
+
+# source /home/anya/Documents/llm_tiny_ideas/coconut-outer/coconut/setup.sh
+
+# CUDA_VISIBLE_DEVICES=2 python run_full_single3.py use_wandb=False
+
+# CUDA_VISIBLE_DEVICES=2 python run_full_single3.py
+# CUDA_VISIBLE_DEVICES=3 python run_full_single3.py generations_per_prompt=1
+# CUDA_VISIBLE_DEVICES=4 python run_full_single3.py reward_type=prob
+# CUDA_VISIBLE_DEVICES=5 python run_full_single3.py reward_type=prob generations_per_prompt=1
+# CUDA_VISIBLE_DEVICES=6 python run_full_single3.py reward_type=prob lr=1e-5
+
+
+
+
+

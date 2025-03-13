@@ -17,3 +17,5 @@ CUDA_VISIBLE_DEVICES=2 python run_full_single.py use_wandb=False total_batch_siz
 MASTER_PORT=29502 CUDA_VISIBLE_DEVICES=3,4,5,6 torchrun --nnodes 1 --nproc_per_node 4 run_full_ddp.py generation.generations_per_prompt=1 loss.loss_type=logp total_batch_size=6 per_device_batch_size=1 generation.as_full_distribution=True generation.step_for_answer=10 generation.max_length=1024
 
 CUDA_VISIBLE_DEVICES=2 python run_full_single.py generation.generations_per_prompt=1 loss.loss_type=logp total_batch_size=3 per_device_batch_size=1 generation.as_full_distribution=True generation.step_for_answer=80 generation.max_length=1024 generation.compute_everything=True
+
+CUDA_VISIBLE_DEVICES=2 python run_full_single.py generation.generations_per_prompt=1 loss.loss_type=logp total_batch_size=3 per_device_batch_size=1 generation.as_full_distribution=True generation.step_for_answer=80 generation.max_length=1024 generation.compute_everything=True
