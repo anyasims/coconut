@@ -15,8 +15,8 @@
 # git remote rename origin upstream
 # git remote add origin https://github.com/anyasims/coconut.git
 # git branch -M main
-# git remote set-url origin git@github.com:anyasims/coconut.git
-# git push origin main
+### git remote set-url origin git@github.com:anyasims/coconut.git
+### git push origin main
 
 ## other
 # conda install -c anaconda ipykernel

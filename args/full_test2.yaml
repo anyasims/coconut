@@ -31,16 +31,33 @@ include_cot_loss: True
 
 # CUDA_VISIBLE_DEVICES=0 python run_full_single2.py use_wandb=False
 
+
+### node 06
 # CUDA_VISIBLE_DEVICES=0 python run_full_single2.py generations_per_prompt=4
-# CUDA_VISIBLE_DEVICES=0 python run_full_single2.py generations_per_prompt=1
-# CUDA_VISIBLE_DEVICES=0 python run_full_single2.py generations_per_prompt=4 reward_type="answer_prob"
-# CUDA_VISIBLE_DEVICES=0 python run_full_single2.py generations_per_prompt=1 reward_type="answer_prob"
+# CUDA_VISIBLE_DEVICES=1 python run_full_single2.py generations_per_prompt=4 normalization_type=null
+# CUDA_VISIBLE_DEVICES=2 python run_full_single2.py generations_per_prompt=1
+# CUDA_VISIBLE_DEVICES=3 python run_full_single2.py generations_per_prompt=4 reward_type="answer_prob"
+# CUDA_VISIBLE_DEVICES=4 python run_full_single2.py generations_per_prompt=1 reward_type="answer_prob"
+
+### node 05
 # CUDA_VISIBLE_DEVICES=0 python run_full_single2.py generations_per_prompt=1 reward_type="answer_prob" as_full_distribution=True
-# CUDA_VISIBLE_DEVICES=0 python run_full_single2.py generations_per_prompt=4 reward_type="answer_prob" as_full_distribution=True include_cot_loss=False
-# CUDA_VISIBLE_DEVICES=0 python run_full_single2.py generations_per_prompt=1 reward_type="answer_prob" as_full_distribution=True temperature=0.1
-# CUDA_VISIBLE_DEVICES=0 python run_full_single2.py generations_per_prompt=4 reward_type="answer_prob" as_full_distribution=True include_cot_loss=False temperature=0.1
-# CUDA_VISIBLE_DEVICES=0 python run_full_single2.py generations_per_prompt=1 reward_type="answer_prob" as_full_distribution=True temperature=0.1 teacher_forcing=0.0
-# CUDA_VISIBLE_DEVICES=0 python run_full_single2.py generations_per_prompt=4 reward_type="answer_prob" as_full_distribution=True include_cot_loss=False temperature=0.1 teacher_forcing=0.0
+# CUDA_VISIBLE_DEVICES=1 python run_full_single2.py generations_per_prompt=1 reward_type="answer_prob" as_full_distribution=True include_cot_loss=False
+# CUDA_VISIBLE_DEVICES=4 python run_full_single2.py generations_per_prompt=1 reward_type="answer_prob" as_full_distribution=True temperature=0.1
+# CUDA_VISIBLE_DEVICES=5 python run_full_single2.py generations_per_prompt=1 reward_type="answer_prob" as_full_distribution=True include_cot_loss=False temperature=0.1
+# CUDA_VISIBLE_DEVICES=6 python run_full_single2.py generations_per_prompt=1 reward_type="answer_prob" as_full_distribution=True temperature=0.1 teacher_forcing=0.0
+
+### node 06
+# CUDA_VISIBLE_DEVICES=5 python run_full_single2.py generations_per_prompt=1 reward_type="answer_prob" as_full_distribution=True include_cot_loss=False temperature=0.1 teacher_forcing=0.0
+
+### node 06
+# CUDA_VISIBLE_DEVICES=0 python run_full_single2.py generations_per_prompt=1 as_full_distribution=True per_device_batch_size=2
+# CUDA_VISIBLE_DEVICES=1 python run_full_single2.py generations_per_prompt=4 reward_type="answer_prob" seed=1
+# CUDA_VISIBLE_DEVICES=2 python run_full_single2.py generations_per_prompt=4 reward_type="answer_prob" include_cot_loss=False
+
+### node 05
+# CUDA_VISIBLE_DEVICES=0 python run_full_single2.py generations_per_prompt=1 reward_type="answer_prob" as_full_distribution=True temperature=0.01
+# CUDA_VISIBLE_DEVICES=1 python run_full_single2.py generations_per_prompt=1 reward_type="answer_prob" as_full_distribution=True include_cot_loss=False temperature=0.01
+
 
 
 
