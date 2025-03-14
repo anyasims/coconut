@@ -137,9 +137,7 @@ class Trainer:
             run_name += f"-D{self.dataset_size}" if self.dataset_size is not None else ""
             run_name += f"-lr{cfg.lr:.0e}"
             # loss
-            if self.kl_coef > 0:
-                run_name += f"-kl_full" if self.kl_type == "full" else ""
-                run_name += f"{self.kl_coef}"
+            run_name += f"-kl_{self.kl_type}{self.kl_coef}" if self.kl_coef != 0.0 else ""
             run_name += f"-ent{self.entropy_coef}" if self.entropy_coef != 0.0 else ""
             # model
             short_model_name = f"Qw{cfg.base_model.split("/")[-1].split("-")[1]}" if "Qwen" in cfg.base_model else cfg.base_model.split("/")[-1]
