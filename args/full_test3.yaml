@@ -13,15 +13,20 @@ dataset_size: null # for debugging to overfit to a small dataset
 seed: 0
 
 generations_per_prompt: 4
-normalization_type:  grpo # grpo, rloo, or null
+cot_reward_type: "prob" # "binary", "prob", null
+ans_reward_type: "prob" # "binary", "prob", null
+cot_normalization_type:  grpo # grpo, rloo, or null
+ans_normalization_type:  grpo # grpo, rloo, or null
 max_new_tokens: 512
+patch_in_answer_prompt: True
 temperature: 1.0
 
 kl_type: "sample" # "sample", "full"
 kl_coef: 0.001
 entropy_coef: 0.001
 
-reward_type: "binary" # "binary", "prob",
+use_ddp: false
+
 
 # source /home/anya/Documents/llm_tiny_ideas/coconut-outer/coconut/setup.sh
 
