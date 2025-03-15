@@ -19,3 +19,36 @@ MASTER_PORT=29502 CUDA_VISIBLE_DEVICES=3,4,5,6 torchrun --nnodes 1 --nproc_per_n
 CUDA_VISIBLE_DEVICES=2 python run_full_single.py generation.generations_per_prompt=1 loss.loss_type=logp total_batch_size=3 per_device_batch_size=1 generation.as_full_distribution=True generation.step_for_answer=80 generation.max_length=1024 generation.compute_everything=True
 
 CUDA_VISIBLE_DEVICES=2 python run_full_single.py generation.generations_per_prompt=1 loss.loss_type=logp total_batch_size=3 per_device_batch_size=1 generation.as_full_distribution=True generation.step_for_answer=80 generation.max_length=1024 generation.compute_everything=True
+
+############################################################################################################
+# 15/03/2025
+
+CUDA_VISIBLE_DEVICES=0 python run_full3.py
+CUDA_VISIBLE_DEVICES=0 python run_full3.py cot_normalization_type=rloo ans_normalization_type=rloo
+CUDA_VISIBLE_DEVICES=1 python run_full3.py cot_normalization_type=null ans_normalization_type=null
+CUDA_VISIBLE_DEVICES=1 python run_full3.py cot_reward_type=prob
+CUDA_VISIBLE_DEVICES=2 python run_full3.py cot_reward_type=prob cot_normalization_type=rloo ans_normalization_type=rloo
+CUDA_VISIBLE_DEVICES=2 python run_full3.py cot_reward_type=prob cot_normalization_type=null ans_normalization_type=null
+
+CUDA_VISIBLE_DEVICES=3 python run_full3.py cot_reward_type=prob patch_in_answer_prompt=true
+CUDA_VISIBLE_DEVICES=3 python run_full3.py cot_reward_type=prob cot_normalization_type=rloo ans_normalization_type=rloo patch_in_answer_prompt=true
+CUDA_VISIBLE_DEVICES=4 python run_full3.py cot_reward_type=prob cot_normalization_type=null ans_normalization_type=null patch_in_answer_prompt=true
+CUDA_VISIBLE_DEVICES=4 python run_full3.py cot_reward_type=prob ans_reward_type=prob
+CUDA_VISIBLE_DEVICES=5 python run_full3.py cot_reward_type=prob ans_reward_type=prob cot_normalization_type=rloo ans_normalization_type=rloo
+CUDA_VISIBLE_DEVICES=5 python run_full3.py cot_reward_type=prob ans_reward_type=prob cot_normalization_type=null ans_normalization_type=null
+
+CUDA_VISIBLE_DEVICES=6 python run_full3.py cot_reward_type=prob ans_reward_type=prob patch_in_answer_prompt=true
+CUDA_VISIBLE_DEVICES=6 python run_full3.py cot_reward_type=prob ans_reward_type=prob cot_normalization_type=rloo ans_normalization_type=rloo patch_in_answer_prompt=true
+CUDA_VISIBLE_DEVICES=7 python run_full3.py cot_reward_type=prob ans_reward_type=prob cot_normalization_type=null ans_normalization_type=null patch_in_answer_prompt=true
+CUDA_VISIBLE_DEVICES=7 python run_full3.py generations_per_prompt=1
+CUDA_VISIBLE_DEVICES=2 python run_full3.py generations_per_prompt=1 cot_reward_type=prob
+CUDA_VISIBLE_DEVICES=2 python run_full3.py generations_per_prompt=1 cot_reward_type=prob patch_in_answer_prompt=true
+CUDA_VISIBLE_DEVICES=7 python run_full3.py generations_per_prompt=1 cot_reward_type=prob ans_reward_type=prob
+CUDA_VISIBLE_DEVICES=7 python run_full3.py generations_per_prompt=1 cot_reward_type=prob ans_reward_type=prob patch_in_answer_prompt=true
+
+
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nnodes 1 --nproc_per_node 2 run_full3.py max_new_tokens=256
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nnodes 1 --nproc_per_node 2 run_full3.py max_new_tokens=256 cot_reward_type=prob ans_reward_type=prob patch_in_answer_prompt=true
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nnodes 1 --nproc_per_node 2 run_full3.py max_new_tokens=256 cot_reward_type=prob ans_reward_type=prob
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nnodes 1 --nproc_per_node 2 run_full3.py max_new_tokens=256 cot_reward_type=prob  patch_in_answer_prompt=true
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nnodes 1 --nproc_per_node 2 run_full3.py max_new_tokens=256 cot_reward_type=prob
