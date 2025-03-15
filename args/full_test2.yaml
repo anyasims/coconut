@@ -1,0 +1,64 @@
+base_model: Qwen/Qwen2.5-0.5b
+dataset: svamp
+
+use_wandb: True
+run_name_prefix: "RUNS2"
+wandb_project: coconut
+
+max_iters: 3000
+total_batch_size: 64
+per_device_batch_size: 4 # 4
+lr: 1e-6
+dataset_size: null # for debugging to overfit to a small dataset
+seed: 0
+
+generations_per_prompt: 4
+normalization_type:  grpo # grpo, rloo, or none
+cot_length: 100
+as_full_distribution: False
+temperature: 1.0
+teacher_forcing: 1.0
+reward_type: "answer_generated" # "answer_generated", "answer_prob"
+answer_prompt: "....Answer: "
+
+kl_type: "sample" # "sample", "full"
+kl_coef: 0.001
+entropy_coef: 0.001
+include_answer_loss: True
+include_cot_loss: True
+
+# source /home/anya/Documents/llm_tiny_ideas/coconut-outer/coconut/setup.sh
+
+# CUDA_VISIBLE_DEVICES=0 python run_full_single2.py use_wandb=False
+
+
+### node 06
+# CUDA_VISIBLE_DEVICES=0 python run_full_single2.py generations_per_prompt=4
+# CUDA_VISIBLE_DEVICES=1 python run_full_single2.py generations_per_prompt=4 normalization_type=null
+# CUDA_VISIBLE_DEVICES=2 python run_full_single2.py generations_per_prompt=1
+# CUDA_VISIBLE_DEVICES=3 python run_full_single2.py generations_per_prompt=4 reward_type="answer_prob"
+# CUDA_VISIBLE_DEVICES=4 python run_full_single2.py generations_per_prompt=1 reward_type="answer_prob"
+
+### node 05
+# CUDA_VISIBLE_DEVICES=0 python run_full_single2.py generations_per_prompt=1 reward_type="answer_prob" as_full_distribution=True
+# CUDA_VISIBLE_DEVICES=1 python run_full_single2.py generations_per_prompt=1 reward_type="answer_prob" as_full_distribution=True include_cot_loss=False
+# CUDA_VISIBLE_DEVICES=4 python run_full_single2.py generations_per_prompt=1 reward_type="answer_prob" as_full_distribution=True temperature=0.1
+# CUDA_VISIBLE_DEVICES=5 python run_full_single2.py generations_per_prompt=1 reward_type="answer_prob" as_full_distribution=True include_cot_loss=False temperature=0.1
+# CUDA_VISIBLE_DEVICES=6 python run_full_single2.py generations_per_prompt=1 reward_type="answer_prob" as_full_distribution=True temperature=0.1 teacher_forcing=0.0
+
+### node 06
+# CUDA_VISIBLE_DEVICES=5 python run_full_single2.py generations_per_prompt=1 reward_type="answer_prob" as_full_distribution=True include_cot_loss=False temperature=0.1 teacher_forcing=0.0
+
+### node 06
+# CUDA_VISIBLE_DEVICES=0 python run_full_single2.py generations_per_prompt=1 as_full_distribution=True per_device_batch_size=2
+# CUDA_VISIBLE_DEVICES=1 python run_full_single2.py generations_per_prompt=4 reward_type="answer_prob" seed=1
+# CUDA_VISIBLE_DEVICES=2 python run_full_single2.py generations_per_prompt=4 reward_type="answer_prob" include_cot_loss=False
+
+### node 05
+# CUDA_VISIBLE_DEVICES=0 python run_full_single2.py generations_per_prompt=1 reward_type="answer_prob" as_full_distribution=True temperature=0.01
+# CUDA_VISIBLE_DEVICES=1 python run_full_single2.py generations_per_prompt=1 reward_type="answer_prob" as_full_distribution=True include_cot_loss=False temperature=0.01
+
+
+
+
+

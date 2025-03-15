@@ -1,0 +1,67 @@
+base_model: Qwen/Qwen2.5-0.5b
+dataset: gsm8k_hash
+
+use_wandb: True
+run_name_prefix: "RUNS3"
+wandb_project: coconut
+
+max_iters: 3000
+eval_freq: 100
+eval_total_batch_size: 128
+total_batch_size: 64
+per_device_batch_size: 4 # 4
+lr: 1e-6
+dataset_size: null # for debugging to overfit to a small dataset
+seed: 0
+
+generations_per_prompt: 4
+cot_reward_type: binary # binary, prob, null
+ans_reward_type: binary # binary, prob, null
+cot_normalization_type:  grpo # grpo, rloo, null
+ans_normalization_type:  grpo # grpo, rloo, null
+max_new_tokens: 200
+patch_in_answer_prompt: false
+temperature: 1.0
+
+kl_type: "sample" # "sample", "full"
+kl_coef: 0.001
+entropy_coef: 0.001
+
+# source /home/anya/Documents/llm_tiny_ideas/coconut-outer/coconut/setup.sh
+
+# CUDA_VISIBLE_DEVICES=2 python run_full3.py use_wandb=False
+# CUDA_VISIBLE_DEVICES=2,3 torchrun --nnodes 1 --nproc_per_node 2 run_full3.py use_wandb=False
+
+####
+#### node-07
+# CUDA_VISIBLE_DEVICES=0 python run_full3.py
+# CUDA_VISIBLE_DEVICES=1 python run_full3.py cot_normalization_type=null ans_normalization_type=null
+
+# CUDA_VISIBLE_DEVICES=2 python run_full3.py cot_reward_type=prob
+# CUDA_VISIBLE_DEVICES=3 python run_full3.py cot_reward_type=prob cot_normalization_type=null ans_normalization_type=null
+
+# CUDA_VISIBLE_DEVICES=6 python run_full3.py cot_reward_type=prob patch_in_answer_prompt=true
+# CUDA_VISIBLE_DEVICES=7 python run_full3.py cot_reward_type=prob cot_normalization_type=null ans_normalization_type=null patch_in_answer_prompt=true
+
+#### node-11
+# CUDA_VISIBLE_DEVICES=0 python run_full3.py cot_reward_type=prob ans_reward_type=prob
+# CUDA_VISIBLE_DEVICES=1 python run_full3.py cot_reward_type=prob ans_reward_type=prob cot_normalization_type=null ans_normalization_type=null
+
+# CUDA_VISIBLE_DEVICES=2 python run_full3.py cot_reward_type=prob ans_reward_type=prob patch_in_answer_prompt=true
+# CUDA_VISIBLE_DEVICES=3 python run_full3.py cot_reward_type=prob ans_reward_type=prob cot_normalization_type=null ans_normalization_type=null patch_in_answer_prompt=true
+
+# CUDA_VISIBLE_DEVICES=4 python run_full3.py generations_per_prompt=1
+# CUDA_VISIBLE_DEVICES=5 python run_full3.py generations_per_prompt=1 cot_reward_type=prob
+
+#### node-12
+# CUDA_VISIBLE_DEVICES=2 python run_full3.py generations_per_prompt=1 cot_reward_type=prob patch_in_answer_prompt=true
+# CUDA_VISIBLE_DEVICES=4 python run_full3.py generations_per_prompt=1 cot_reward_type=prob ans_reward_type=prob
+# CUDA_VISIBLE_DEVICES=7 python run_full3.py generations_per_prompt=1 cot_reward_type=prob ans_reward_type=prob patch_in_answer_prompt=true
+
+
+# CUDA_VISIBLE_DEVICES=0,1 torchrun --nnodes 1 --nproc_per_node 2 run_full3.py max_new_tokens=256
+# CUDA_VISIBLE_DEVICES=0,1 torchrun --nnodes 1 --nproc_per_node 2 run_full3.py max_new_tokens=256 cot_reward_type=prob ans_reward_type=prob patch_in_answer_prompt=true
+
+
+
+
