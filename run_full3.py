@@ -112,7 +112,8 @@ class Trainer:
             print(f"Dataset: {cfg.dataset}")
             print(f"Train split: {train_split_name}")
             print(f"Test split: {test_split_name}")
-            print(f"Train dataset size: {len(train_dataset)}\n\n")
+            print(f"Train dataset size: {len(train_dataset)}")
+            print(f"Test dataset size: {len(test_dataset)}\n\n" if test_dataset is not None else "\n\n")
         assert cfg.dataset.endswith("_hash"), f"{cfg.dataset=}"
 
         # answer prompt
