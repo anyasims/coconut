@@ -344,7 +344,8 @@ class Trainer:
         questions_inputs = self.tokenizer(questions_text, return_tensors="pt", padding=True, padding_side="left")
         questions_inputs = {k: v.to(self.model.device) for k, v in questions_inputs.items()}
         tokenized_answers = self.tokenizer(answer_text).input_ids
-        tokenized_answers = [[self.space_id] + a + [self.tokenizer.eos_token_id] for a in tokenized_answers]
+        # tokenized_answers = [[self.space_id] + a + [self.tokenizer.eos_token_id] for a in tokenized_answers]
+        tokenized_answers = [[self.space_id] + a + [self.space_id] for a in tokenized_answers]
 
         # shapes
         batch_size = questions_inputs["input_ids"].shape[0]
@@ -596,7 +597,10 @@ class Trainer:
     
     def do_one_full_batch(self, i, num_batches, per_device_prompt_batch_size, dataset=None, data_loader=None, is_eval=False):
         if self.using_ddp:
-            data_loader.sampler.set_epoch(i) # shuffling every iter for now to avoid the effect of epochs
+            if is_eval:
+                data_loader.sampler.set_epoch(0)
+            else:
+                data_loader.sampler.set_epoch(i) # shuffling every iter for now to avoid the effect of epochs
             data_iter = iter(data_loader)
         # GRADIENT ACCUMULATION
         for j in tqdm.tqdm(range(num_batches),
@@ -611,7 +615,11 @@ class Trainer:
                 dataset_batch = next(data_iter)
             else:
                 # sample batch randomly from the dataset
-                indices = random.sample(range(len(dataset)), per_device_prompt_batch_size)
+                if is_eval:
+                    start_idx = j * self.world_size * per_device_prompt_batch_size + self.rank * per_device_prompt_batch_size
+                    indices = torch.arange(start_idx, start_idx + per_device_prompt_batch_size)
+                else:
+                    indices = random.sample(range(len(dataset)), per_device_prompt_batch_size)
                 dataset_batch = dataset.select(indices)
             questions_text = dataset_batch["question"]
             answers_text = dataset_batch["answer"]
