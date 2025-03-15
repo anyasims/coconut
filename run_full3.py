@@ -83,20 +83,38 @@ class Trainer:
 
         # dataset
         dataset = DatasetDict.load_from_disk(f"./data/my_data/{cfg.dataset}")
-        split_name = "train" if "train" in dataset.keys() else list(dataset.keys())[0]
-        train_dataset = dataset[split_name]
+        if "train" in dataset.keys():
+            train_split_name = "train"
+            non_train_splits = {k: v for k, v in dataset.items() if k != "train"}
+            test_split_name = max(non_train_splits, key=lambda k: len(non_train_splits[k])) # largest split
+        else:
+            train_split_name = max(dataset, key=lambda k: len(dataset[k])) # largest split
+            test_split_name = None
+        
+        train_dataset = dataset[train_split_name]
+        test_dataset = dataset[test_split_name] if test_split_name is not None else None
+        self.do_eval = test_dataset is not None
         if self.dataset_size is not None:
             train_dataset = train_dataset.select(range(self.dataset_size))
-        if self.rank == 0:
-            print(f"Dataset: {cfg.dataset}")
-            print(f"Split: {split_name}")
-            print(f"Dataset size: {len(train_dataset)}")
-        assert cfg.dataset.endswith("_hash"), f"{cfg.dataset=}"
         if self.using_ddp:
             train_sampler = DistributedSampler(train_dataset, num_replicas=self.world_size, rank=self.rank, shuffle=True)
+            test_sampler = DistributedSampler(test_dataset, num_replicas=self.world_size, rank=self.rank, shuffle=False) if test_dataset is not None else None
             self.train_loader = DataLoader(train_dataset, batch_size=self.per_device_prompt_batch_size, sampler=train_sampler)
+            self.test_loader = DataLoader(test_dataset, batch_size=self.eval_per_device_prompt_batch_size, sampler=test_sampler) if test_dataset is not None else None
+            self.train_dataset = None
+            self.test_dataset = None
         else:
             self.train_dataset = train_dataset
+            self.test_dataset = test_dataset if test_dataset is not None else None
+            self.train_loader = None
+            self.test_loader = None
+        if self.rank == 0:
+            print(f"Dataset: {cfg.dataset}")
+            print(f"Train split: {train_split_name}")
+            print(f"Test split: {test_split_name}")
+            print(f"Train dataset size: {len(train_dataset)}")
+            print(f"Test dataset size: {len(test_dataset)}\n\n" if test_dataset is not None else "\n\n")
+        assert cfg.dataset.endswith("_hash"), f"{cfg.dataset=}"
 
         # answer prompt
         answer_prompt_id = self.tokenizer.encode("####")
@@ -129,6 +147,16 @@ class Trainer:
         assert self.per_device_batch_size % self.generations_per_prompt == 0, f"{self.per_device_batch_size=} {self.generations_per_prompt=}"
         self.per_device_prompt_batch_size = self.per_device_batch_size // self.generations_per_prompt
         self.dataset_size = cfg.dataset_size
+
+        ### eval
+        self.eval_freq = cfg.eval_freq
+        self.eval_total_batch_size = cfg.eval_total_batch_size
+        self.eval_per_device_batch_size = self.per_device_batch_size * 2
+        assert self.eval_total_batch_size % (self.eval_per_device_batch_size * self.world_size) == 0, f"{self.eval_total_batch_size=} {self.eval_per_device_batch_size=}, {self.world_size=}"
+        self.eval_num_subbatches = self.eval_total_batch_size // (self.eval_per_device_batch_size * self.world_size)
+        assert self.eval_per_device_batch_size * self.world_size * self.eval_num_subbatches == self.eval_total_batch_size, f"{self.eval_per_device_batch_size=} {self.world_size=} {self.eval_num_subbatches=} {self.eval_total_batch_size=}"
+        assert self.eval_per_device_batch_size % self.generations_per_prompt == 0, f"{self.eval_per_device_batch_size=} {self.generations_per_prompt=}"
+        self.eval_per_device_prompt_batch_size = self.eval_per_device_batch_size // self.generations_per_prompt
 
         # generation
         self.max_new_tokens = cfg.max_new_tokens
@@ -213,6 +241,13 @@ class Trainer:
             print(f"Dataset size: {self.dataset_size} (smaller for debugging)")
             print(f"Lr: {cfg.lr}")
             print(f"-----------------------------------\n")
+            print(f"---EVAL CONFIG:")
+            print(f"Eval freq: {self.eval_freq}")
+            print(f"Eval total batch size: {self.eval_total_batch_size}")
+            print(f"Eval per device batch size: {self.eval_per_device_batch_size}")
+            print(f"Eval num subbatches: {self.eval_num_subbatches}")
+            print(f"Eval per device prompt batch size: {self.eval_per_device_prompt_batch_size}")
+            print(f"-----------------------------------\n")
             print(f"---GENERATION CONFIG:")
             print(f"Max new tokens: {self.max_new_tokens}")
             print(f"Temperature: {self.temperature}")
@@ -261,9 +296,9 @@ class Trainer:
         self.scaler.update()
         self.optimizer.zero_grad()  # Reset gradients after update
 
-    def get_loss(self, x):
+    def get_loss(self, x, per_device_batch_size):
         cot_logp, ans_logp, kl, entropy, cot_normalized_reward, ans_normalized_reward = x
-        assert cot_logp.shape == ans_logp.shape == kl.shape == entropy.shape == cot_normalized_reward.shape == ans_normalized_reward.shape == (self.per_device_batch_size,), f"{logp.shape=}, {kl.shape=}, {entropy.shape=}, {cot_normalized_reward.shape=}, {ans_normalized_reward.shape=}"
+        assert cot_logp.shape == ans_logp.shape == kl.shape == entropy.shape == cot_normalized_reward.shape == ans_normalized_reward.shape == (per_device_batch_size,), f"{cot_logp.shape=}, {ans_logp.shape=}, {kl.shape=}, {entropy.shape=}, {cot_normalized_reward.shape=}, {ans_normalized_reward.shape=}"
 
         cot_pg_loss = - cot_logp * cot_normalized_reward
         ans_pg_loss = - ans_logp * ans_normalized_reward
@@ -280,9 +315,9 @@ class Trainer:
         return loss.mean() / self.gradient_accumulation_steps, metrics
     
     @torch.no_grad()
-    def normalize_reward(self, reward, normalization_type):
+    def normalize_reward(self, reward, normalization_type, per_device_prompt_batch_size):
         if self.generations_per_prompt > 1:
-            reward = reward.reshape(self.per_device_prompt_batch_size, self.generations_per_prompt)
+            reward = reward.reshape(per_device_prompt_batch_size, self.generations_per_prompt)
             if normalization_type == "grpo":
                 normalized_reward = (reward - reward.mean(1, keepdim=True)) / (reward.std(1, keepdim=True) + 1e-6)
             elif normalization_type == "rloo":
@@ -303,13 +338,15 @@ class Trainer:
         self,
         questions_text,
         answer_text,
-        tokenizer
+        per_device_prompt_batch_size,
+        is_eval=False,
     ):
         model = self.model.module if self.using_ddp else self.model
         questions_inputs = self.tokenizer(questions_text, return_tensors="pt", padding=True, padding_side="left")
         questions_inputs = {k: v.to(self.model.device) for k, v in questions_inputs.items()}
-        tokenized_answers = tokenizer(answer_text).input_ids
-        tokenized_answers = [[self.space_id] + a + [self.tokenizer.eos_token_id] for a in tokenized_answers]
+        tokenized_answers = self.tokenizer(answer_text).input_ids
+        # tokenized_answers = [[self.space_id] + a + [self.tokenizer.eos_token_id] for a in tokenized_answers]
+        tokenized_answers = [[self.space_id] + a + [self.space_id] for a in tokenized_answers]
 
         # shapes
         batch_size = questions_inputs["input_ids"].shape[0]
@@ -485,8 +522,8 @@ class Trainer:
             assert not torch.isnan(ans_reward).any(), f"{ans_reward=}"
             assert not torch.isinf(ans_reward).any(), f"{ans_reward=}"
             # normalize reward
-            cot_normalized_reward = self.normalize_reward(cot_reward, self.cot_normalization_type)
-            ans_normalized_reward = self.normalize_reward(ans_reward, self.ans_normalization_type)
+            cot_normalized_reward = self.normalize_reward(cot_reward, self.cot_normalization_type, per_device_prompt_batch_size)
+            ans_normalized_reward = self.normalize_reward(ans_reward, self.ans_normalization_type, per_device_prompt_batch_size)
             assert not torch.isnan(cot_normalized_reward).any(), f"{cot_normalized_reward=}"
             assert not torch.isinf(cot_normalized_reward).any(), f"{cot_normalized_reward=}"
             assert not torch.isnan(ans_normalized_reward).any(), f"{ans_normalized_reward=}"
@@ -547,114 +584,156 @@ class Trainer:
         metrics["answer_p_length_normalized"] = answer_p_length_normalized.mean()
         metrics["ref_answer_p_length_normalized"] = ref_answer_p_length_normalized.mean()
 
-        assert cot_logp.requires_grad == True, f"{cot_logp.requires_grad=}"
-        assert ans_logp.requires_grad == True, f"{ans_logp.requires_grad=}"
-        assert entropy.requires_grad == True, f"{entropy.requires_grad=}"
-        assert kl.requires_grad == True, f"{kl.requires_grad=}"
-        assert cot_normalized_reward.requires_grad == False, f"{cot_normalized_reward.requires_grad=}"
-        assert ans_normalized_reward.requires_grad == False, f"{ans_normalized_reward.requires_grad=}"
-        return (cot_logp, ans_logp, kl, entropy, cot_normalized_reward, ans_normalized_reward), decoded_generations, metrics
+        x = (cot_logp, ans_logp, kl, entropy, cot_normalized_reward, ans_normalized_reward)
+        if is_eval:
+            assert [v.requires_grad for v in x] == [False]*6, f"{[v.requires_grad for v in x]=}"
+        else:
+            assert cot_logp.requires_grad == True, f"{cot_logp.requires_grad=}"
+            assert ans_logp.requires_grad == True, f"{ans_logp.requires_grad=}"
+            assert entropy.requires_grad == True, f"{entropy.requires_grad=}"
+            assert kl.requires_grad == True, f"{kl.requires_grad=}"
+            assert cot_normalized_reward.requires_grad == False, f"{cot_normalized_reward.requires_grad=}"
+            assert ans_normalized_reward.requires_grad == False, f"{ans_normalized_reward.requires_grad=}"
+        return x, decoded_generations, metrics
+    
+    def do_one_full_batch(self, i, num_batches, per_device_prompt_batch_size, dataset=None, data_loader=None, is_eval=False):
+        if self.using_ddp:
+            if is_eval:
+                data_loader.sampler.set_epoch(0)
+            else:
+                data_loader.sampler.set_epoch(i) # shuffling every iter for now to avoid the effect of epochs
+            data_iter = iter(data_loader)
+        # GRADIENT ACCUMULATION
+        for j in tqdm.tqdm(range(num_batches),
+                           desc="Evaluation" if is_eval else "Gradient accumulation",
+                           disable=True
+                           ):
+        
+            # GENERATE ROLLOUTS
+            start_time = time.time()
+            self.model.eval()
+            if self.using_ddp:
+                dataset_batch = next(data_iter)
+            else:
+                # sample batch randomly from the dataset
+                if is_eval:
+                    start_idx = j * self.world_size * per_device_prompt_batch_size + self.rank * per_device_prompt_batch_size
+                    indices = torch.arange(start_idx, start_idx + per_device_prompt_batch_size)
+                else:
+                    indices = random.sample(range(len(dataset)), per_device_prompt_batch_size)
+                dataset_batch = dataset.select(indices)
+            questions_text = dataset_batch["question"]
+            answers_text = dataset_batch["answer"]
+            questions_inputs = self.tokenizer(questions_text, return_tensors="pt", padding=True, padding_side="left")
+            answer_inputs = self.tokenizer(answers_text, return_tensors="pt", padding=True, padding_side="right")
+            questions_inputs = {k: v.to(self.model.device) for k, v in questions_inputs.items()}
+            answer_inputs = {k: v.to(self.model.device) for k, v in answer_inputs.items()}
+
+            # GENERATE
+            start_time = time.time()
+            x, decoded_generations, generation_metrics = self.generate(questions_text, answers_text, per_device_prompt_batch_size, is_eval=is_eval)
+            generation_metrics = {f"gen/{k}": v for k, v in generation_metrics.items()}
+            gen_time = time.time()-start_time
+            generation_metrics["gen/time"] = torch.tensor(gen_time, device=self.device)
+
+            # COMPUTE LOSS
+            start_time = time.time()
+            with self.ctx: 
+                loss, loss_metrics = self.get_loss(x, per_device_prompt_batch_size*self.generations_per_prompt)
+                if not is_eval:
+                    self.scaler.scale(loss).backward()
+            loss_metrics = {f"loss/{k}": v for k, v in loss_metrics.items()}
+            loss_time = time.time()-start_time
+            loss_metrics["loss/time"] = torch.tensor(loss_time, device=self.device)
+
+            # UPDATE METRICS
+            if j == 0:
+                metrics_s = {**generation_metrics, **loss_metrics}
+            else:
+                metrics = {**generation_metrics, **loss_metrics}
+                metrics_s = {k: v + metrics[k] for k, v in metrics_s.items()}
+
+            if j % 1 == 0 and self.rank == 0:
+                response, ans_gen, ans_argmax, contains_ap, contains_ans, ans_prob, length, cot_r, ans_r = decoded_generations[0]
+                peak_mem_allocated = torch.cuda.max_memory_allocated() // 1024 // 1024
+                peak_mem_reserved = torch.cuda.max_memory_reserved() // 1024 // 1024
+                # print
+                print("-"*50)
+                print(f"Generation time: {gen_time:.1f}s")
+                print(f"Loss time: {loss_time:.1f}s")
+                print(f"peak memory allocated: {peak_mem_allocated} MiB, reserved: {peak_mem_reserved} MiB")
+                print("-"*50)
+                print(f"              QUESTION: {questions_text[0]}")
+                print(f"              RESPONSE: {response}")
+                print(f"CONTAINS ANSWER PROMPT: {contains_ap}")
+                print(f"       CONTAINS ANSWER: {contains_ans}")
+                print(f"      GENERATED ANSWER: {ans_gen}")
+                print(f"         ARGMAX ANSWER: {ans_argmax}")
+                print(f"        CORRECT ANSWER: {answers_text[0]}")
+                if self.ans_reward_type == "prob" or self.cot_reward_type == "prob":
+                    print(f"           ANSWER PROB: {ans_prob:.2e}")
+                print(f"                LENGTH: {length}")
+                print(f" COT NORMALIZED REWARD: {cot_r:.2e}")
+                print(f" ANS NORMALIZED REWARD: {ans_r:.2e}")
+                print("-"*50)
+                if is_eval:
+                    print(f"EVALUATION: Iter {i+1}/{self.max_iters}, batch {j+1}/{num_batches}, Mean contains answer: {metrics_s['gen/contains_answer']/(j+1):.2f}")
+                else:
+                    print(f"Iter {i+1}/{self.max_iters}, Accumulation step {j+1}/{num_batches}, Mean contains answer: {metrics_s['gen/contains_answer']/(j+1):.2f}")
+                print("\n")
+                del response, ans_gen, ans_argmax, contains_ap, contains_ans, ans_prob, length
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            # cleanup
+            del x, questions_inputs, dataset_batch, generation_metrics, loss_metrics, questions_text, answers_text, decoded_generations
+            gc.collect()
+            torch.cuda.empty_cache()
+        return metrics_s
 
     def run_training_loop(self, num_iters=None):
         """Run the training loop"""
         train_start_time = time.time()
         num_iters = self.max_iters if num_iters is None else num_iters
-        for i in tqdm.tqdm(range(num_iters), desc="Training"):
-            if self.using_ddp:
-                self.train_loader.sampler.set_epoch(i) # shuffling every iter for now to avoid the effect of epochs
-                data_iter = iter(self.train_loader)
-            # GRADIENT ACCUMULATION
-            for j in tqdm.tqdm(range(self.gradient_accumulation_steps), desc="Gradient accumulation", disable=True):
-            
-                # GENERATE ROLLOUTS
-                start_time = time.time()
-                self.model.eval()
-                if self.using_ddp:
-                    dataset_batch = next(data_iter)
-                else:
-                    # sample batch randomly from the dataset
-                    indices = random.sample(range(len(self.train_dataset)), self.per_device_prompt_batch_size)
-                    dataset_batch = self.train_dataset.select(indices)
-                questions_text = dataset_batch["question"]
-                answers_text = dataset_batch["answer"]
-                questions_inputs = self.tokenizer(questions_text, return_tensors="pt", padding=True, padding_side="left")
-                answer_inputs = self.tokenizer(answers_text, return_tensors="pt", padding=True, padding_side="right")
-                questions_inputs = {k: v.to(self.model.device) for k, v in questions_inputs.items()}
-                answer_inputs = {k: v.to(self.model.device) for k, v in answer_inputs.items()}
+        
+        for i in tqdm.tqdm(range(num_iters+1), desc="Training", total=num_iters):
 
-                # GENERATE
-                start_time = time.time()
-                x, decoded_generations, generation_metrics = self.generate(questions_text, answers_text, self.tokenizer)
-                generation_metrics = {f"gen/{k}": v for k, v in generation_metrics.items()}
-                gen_time = time.time()-start_time
-                generation_metrics["gen/time"] = torch.tensor(gen_time, device=self.device)
-
-                # COMPUTE LOSS
-                start_time = time.time()
-                with self.ctx: 
-                    loss, loss_metrics = self.get_loss(x)
-                    self.scaler.scale(loss).backward()
-                loss_metrics = {f"loss/{k}": v for k, v in loss_metrics.items()}
-                loss_time = time.time()-start_time
-                loss_metrics["loss/time"] = torch.tensor(loss_time, device=self.device)
-
-                # UPDATE METRICS
-                if j == 0:
-                    metrics_s = {**generation_metrics, **loss_metrics}
-                else:
-                    metrics = {**generation_metrics, **loss_metrics}
-                    metrics_s = {k: v + metrics[k] for k, v in metrics_s.items()}
-
-                if j % 1 == 0 and self.rank == 0:
-                    response, ans_gen, ans_argmax, contains_ap, contains_ans, ans_prob, length, cot_r, ans_r = decoded_generations[0]
-                    peak_mem_allocated = torch.cuda.max_memory_allocated() // 1024 // 1024
-                    peak_mem_reserved = torch.cuda.max_memory_reserved() // 1024 // 1024
-                    # print
-                    print("-"*50)
-                    print(f"Generation time: {gen_time:.1f}s")
-                    print(f"Loss time: {loss_time:.1f}s")
-                    print(f"peak memory allocated: {peak_mem_allocated} MiB, reserved: {peak_mem_reserved} MiB")
-                    print("-"*50)
-                    print(f"              QUESTION: {questions_text[0]}")
-                    print(f"              RESPONSE: {response}")
-                    print(f"CONTAINS ANSWER PROMPT: {contains_ap}")
-                    print(f"       CONTAINS ANSWER: {contains_ans}")
-                    print(f"      GENERATED ANSWER: {ans_gen}")
-                    print(f"         ARGMAX ANSWER: {ans_argmax}")
-                    print(f"        CORRECT ANSWER: {answers_text[0]}")
-                    if self.ans_reward_type == "prob" or self.cot_reward_type == "prob":
-                        print(f"           ANSWER PROB: {ans_prob:.2e}")
-                    print(f"                LENGTH: {length}")
-                    print(f" COT NORMALIZED REWARD: {cot_r:.2e}")
-                    print(f" ANS NORMALIZED REWARD: {ans_r:.2e}")
-                    print("-"*50)
-                    print(f"Iter {i+1}/{self.max_iters}, Accumulation step {j+1}/{self.gradient_accumulation_steps}, Mean contains answer: {metrics_s['gen/contains_answer']}")
-                    print("\n")
-                    del response, ans_gen, ans_argmax, contains_ap, contains_ans, ans_prob, length
+            # EVAL
+            if (i == 0 or i == num_iters or i % self.eval_freq == 0) and self.do_eval:
+                with torch.no_grad():
+                    metrics_s = self.do_one_full_batch(0, self.eval_num_subbatches, self.eval_per_device_prompt_batch_size, self.test_dataset, self.test_loader, is_eval=True)
+                    metrics_s = {k: v / self.gradient_accumulation_steps for k, v in metrics_s.items()}
+                    if self.using_ddp:
+                        for k, v in metrics_s.items():
+                            dist.all_reduce(v, op=dist.ReduceOp.AVG)
+                    metrics_s.update({"iter": i})
+                    if self.use_wandb and self.rank == 0:
+                        wandb.log(metrics_s)
+                    del metrics_s
                     gc.collect()
                     torch.cuda.empty_cache()
 
-                # cleanup
-                del x, questions_inputs, dataset_batch, generation_metrics, loss_metrics, questions_text, answers_text, decoded_generations
+            if i < num_iters:
+                # FORWARD PASS
+                metrics_s = self.do_one_full_batch(i, self.gradient_accumulation_steps, self.per_device_prompt_batch_size, self.train_dataset, self.train_loader, is_eval=False)
+                # UPDATE MODEL
+                self.apply_update()
+
+                # LOG
+                metrics_s = {k: v / self.gradient_accumulation_steps for k, v in metrics_s.items()}
+                if self.using_ddp:
+                    for k, v in metrics_s.items():
+                        dist.all_reduce(v, op=dist.ReduceOp.AVG)
+                param_metrics = get_model_param_stats(self.model, self.ref_model)
+                metrics_s.update({f"params/{k}": v for k, v in param_metrics.items()})
+                metrics_s.update({"iter": i, "lr": self.optimizer.param_groups[0]["lr"]})
+                if self.use_wandb and self.rank == 0:
+                    wandb.log(metrics_s)
+                del metrics_s, param_metrics
                 gc.collect()
                 torch.cuda.empty_cache()
 
-            # UPDATE MODEL
-            self.apply_update()
-
-            # LOG
-            metrics_s = {k: v / self.gradient_accumulation_steps for k, v in metrics_s.items()}
-            if self.using_ddp:
-                for k, v in metrics_s.items():
-                    dist.all_reduce(v, op=dist.ReduceOp.AVG)
-            param_metrics = get_model_param_stats(self.model, self.ref_model)
-            metrics_s.update({f"params/{k}": v for k, v in param_metrics.items()})
-            metrics_s.update({"iter": i, "lr": self.optimizer.param_groups[0]["lr"]})
-            if self.use_wandb and self.rank == 0:
-                wandb.log(metrics_s)
-            del metrics_s, loss, param_metrics
-            gc.collect()
-            torch.cuda.empty_cache()
+            
 
         if self.rank == 0:
             print(f"Training time: {time.time()-train_start_time:.1f}s")
