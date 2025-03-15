@@ -41,3 +41,4 @@ export PYTHONPATH=$PYTHONPATH:/home/anya/Documents/llm_tiny_ideas/coconut-outer/
 # CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nnodes 1 --nproc_per_node 4 run.py args/gsm_coconut_eval.yaml # eval
 ### ProsQA
 # CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nnodes 1 --nproc_per_node 4 run.py args/prosqa_coconut.yaml
+# CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nnodes 1 --nproc_per_node 4 run.py args/prosqa_coconut.yaml
