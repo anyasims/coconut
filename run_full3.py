@@ -458,8 +458,9 @@ class Trainer:
         # reward
         with torch.no_grad():
             answer_mask_lengths = patched_answer_mask[:, 1:].sum(dim=-1)
-            answer_mask_lengths[answer_mask_lengths == 0] = 1 # avoid division by zero (numerator is zero)
+            answer_mask_lengths[answer_mask_lengths == 0] = 1 # avoid division by zero
             answer_p_length_normalized = torch.exp(ans_logp / answer_mask_lengths.float())
+            answer_p_length_normalized *= (answer_mask_lengths > 1).float()
             ref_answer_p_length_normalized = torch.exp(ans_ref_logp / answer_mask_lengths.float()) # for logging
             # cot reward
             if self.cot_reward_type == "binary":
