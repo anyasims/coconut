@@ -365,6 +365,7 @@ class Trainer:
     def generate(
         self,
         dataset_batch,
+        generations_per_prompt,
         is_eval=False,
     ):
         model = self.model.module if self.using_ddp else self.model
@@ -378,11 +379,11 @@ class Trainer:
 
         # shapes
         batch_size = questions_inputs["input_ids"].shape[0]
-        full_batch_size = batch_size * self.generations_per_prompt
+        full_batch_size = batch_size * generations_per_prompt
         question_length = questions_inputs["input_ids"].shape[1]
         # repeat
-        questions_inputs = careful_repeat_dict(questions_inputs, self.generations_per_prompt)
-        tokenized_answers = [a for a in tokenized_answers for _ in range(self.generations_per_prompt)]
+        questions_inputs = careful_repeat_dict(questions_inputs, generations_per_prompt)
+        tokenized_answers = [a for a in tokenized_answers for _ in range(generations_per_prompt)]
         # generate responses
         with torch.no_grad():
             q_responses_ids = model.generate(
@@ -684,7 +685,7 @@ class Trainer:
                     with torch.no_grad():
                         # GENERATE
                         dataset_batch, epoch = next(self.eval_loader)
-                        _, decoded_generations, generation_metrics = self.generate(dataset_batch, is_eval=True)
+                        _, decoded_generations, generation_metrics = self.generate(dataset_batch, generations_per_prompt=1, is_eval=True)
 
                     # METRICS
                     if j == 0:
@@ -718,7 +719,7 @@ class Trainer:
                     # GENERATE AND FORWARD
                     start_time = time.time()
                     dataset_batch, epoch = next(self.train_loader)
-                    x, decoded_generations, generation_metrics = self.generate(dataset_batch, is_eval=False)
+                    x, decoded_generations, generation_metrics = self.generate(dataset_batch, generations_per_prompt=self.generations_per_prompt, is_eval=False)
                     gen_time = time.time()-start_time
 
                     # LOSS AND UPDATE
