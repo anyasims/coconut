@@ -443,15 +443,17 @@ class Trainer:
             elif self.patch_in_answer_prompt:
                 if contains_eot[i] == 1:
                     patch_ids = [self.space_id, self.answer_prompt_id] + answer_ids
-                    patch_start_idx = eot_idx
-                    answer_start_idx = eot_idx + 2 # for [space, answer_prompt]
                 else:
                     patch_ids = [self.space_id, self.dot_dot_dot_id, self.space_id, self.answer_prompt_id] + answer_ids
-                    patch_start_idx = patched_q_responses_ids.shape[1] - len(patch_ids)
-                    answer_start_idx = patch_start_idx + 3 # for [space, dot_dot_dot, space, answer_prompt]
-                patch_ids = torch.tensor(patch_ids, device=self.device)
+                patch_start_idx = patched_q_responses_ids.shape[1] - len(patch_ids)
+                if contains_eot[i] == 1:
+                    patch_start_idx = min(patch_start_idx, eot_idx)
+                    answer_start_idx = eot_idx + 2 # for [space, answer_prompt]
+                else:
+                    answer_start_idx = patch_start_idx + 4 # for [space, dot_dot_dot, space, answer_prompt]
                 patch_length = len(patch_ids)
                 answer_length = len(answer_ids)
+                patch_ids = torch.tensor(patch_ids, device=self.device)
                 patched_q_responses_ids[i, patch_start_idx:patch_start_idx+patch_length] = patch_ids
                 patched_answer_mask[i, answer_start_idx:answer_start_idx+answer_length] = 1
                 patched_cot_mask[i, answer_start_idx:] = 0
@@ -694,8 +696,8 @@ class Trainer:
                         metrics_s = {k: v + generation_metrics[k] for k, v in metrics_s.items()}
 
                     # PRINT
-                    if self.rank == 0:
-                        prefix = f"EVAL: Iter {i+1}/{num_iters}, subbatch {j+1}/{self.eval_num_subbatches}, epoch {epoch}, "
+                    if self.rank == 0 and j % (self.eval_num_subbatches // 2) == 0:
+                        prefix = f"EVAL: Iter {i+1}/{num_iters}, subbatch {j+1}/{self.eval_num_subbatches}, epoch {epoch+1}, "
                         prefix += f"mean contains answer: {metrics_s['gen/contains_answer']/(j+1):.2f}"
                         self.print_metrics(decoded_generations, dataset_batch["question"], dataset_batch["answer"], prefix=prefix)
 
@@ -739,8 +741,8 @@ class Trainer:
                         metrics_s = {k: v + metrics[k] for k, v in metrics_s.items()}
 
                     # PRINT
-                    if j % 1 == 0 and self.rank == 0:
-                        prefix = f"TRAIN: Iter {i+1}/{num_iters}, acc step {j+1}/{self.gradient_accumulation_steps}, epoch {epoch} "
+                    if self.rank == 0 and j % (self.gradient_accumulation_steps // 2) == 0:
+                        prefix = f"TRAIN: Iter {i+1}/{num_iters}, acc step {j+1}/{self.gradient_accumulation_steps}, epoch {epoch+1}, "
                         prefix += f"mean contains answer: {metrics_s['gen/contains_answer']/(j+1):.2f}"
                         self.print_metrics(decoded_generations, dataset_batch["question"], dataset_batch["answer"], gen_time, loss_time, prefix=prefix)
 

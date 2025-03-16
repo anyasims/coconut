@@ -29,7 +29,7 @@ entropy_coef: 0.001
 
 # source /home/anya/Documents/llm_tiny_ideas/coconut-outer/coconut/setup.sh
 
-# CUDA_VISIBLE_DEVICES=2 python run_full4.py use_wandb=False
+# CUDA_VISIBLE_DEVICES=4 python run_full4.py use_wandb=False
 # CUDA_VISIBLE_DEVICES=2,3 torchrun --nnodes 1 --nproc_per_node 2 run_full4.py use_wandb=False
 
 ####
