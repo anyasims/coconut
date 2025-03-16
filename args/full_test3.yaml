@@ -2,11 +2,11 @@ base_model: Qwen/Qwen2.5-0.5b
 dataset: gsm8k_hash
 
 use_wandb: True
-run_name_prefix: "RUNS3"
+run_name_prefix: "RUNS4"
 wandb_project: coconut
 
 max_iters: 3000
-eval_freq: 100
+eval_freq: 20
 eval_num_samples: 128
 total_batch_size: 64
 per_device_batch_size: 4 # 4
