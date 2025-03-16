@@ -34,12 +34,13 @@ entropy_coef: 0.001
 
 ####
 #### node-07
-# CUDA_VISIBLE_DEVICES=0 python run_full3.py
-# CUDA_VISIBLE_DEVICES=1 python run_full3.py cot_normalization_type=null ans_normalization_type=null
+# CUDA_VISIBLE_DEVICES=4 python run_full3.py
+# CUDA_VISIBLE_DEVICES=5 python run_full3.py cot_normalization_type=null ans_normalization_type=null
 
-# CUDA_VISIBLE_DEVICES=2 python run_full3.py cot_reward_type=prob
-# CUDA_VISIBLE_DEVICES=3 python run_full3.py cot_reward_type=prob cot_normalization_type=null ans_normalization_type=null
+# CUDA_VISIBLE_DEVICES=6 python run_full3.py cot_reward_type=prob
+# CUDA_VISIBLE_DEVICES=7 python run_full3.py cot_reward_type=prob cot_normalization_type=null ans_normalization_type=null
 
+#### node-10
 # CUDA_VISIBLE_DEVICES=6 python run_full3.py cot_reward_type=prob patch_in_answer_prompt=true
 # CUDA_VISIBLE_DEVICES=7 python run_full3.py cot_reward_type=prob cot_normalization_type=null ans_normalization_type=null patch_in_answer_prompt=true
 

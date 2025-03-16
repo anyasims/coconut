@@ -706,6 +706,7 @@ class Trainer:
                     if self.using_ddp:
                         for k, v in metrics_s.items():
                             dist.all_reduce(v, op=dist.ReduceOp.AVG)
+                    metrics_s = {f"eval_{k}": v for k, v in metrics_s.items()}
                     metrics_s.update({"iter": i})
                     if self.use_wandb and self.rank == 0:
                         wandb.log(metrics_s)
