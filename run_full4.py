@@ -166,27 +166,27 @@ class Trainer:
         self.max_iters = cfg.max_iters
         self.total_batch_size = cfg.total_batch_size
         self.per_device_batch_size = cfg.per_device_batch_size
-        assert self.total_batch_size % (self.per_device_batch_size * self.world_size) == 0, f"{self.total_batch_size=} {self.per_device_batch_size=}, {self.world_size=}"
-        self.total_prompt_batch_size = self.total_batch_size // self.generations_per_prompt
         self.gradient_accumulation_steps = self.total_batch_size // (self.per_device_batch_size * self.world_size)
-        assert self.per_device_batch_size * self.world_size * self.gradient_accumulation_steps == self.total_batch_size, f"{self.per_device_batch_size=} {self.world_size=} {self.gradient_accumulation_steps=} {self.total_batch_size=}"
         self.generations_per_prompt = cfg.generations_per_prompt
-        assert self.per_device_batch_size % self.generations_per_prompt == 0, f"{self.per_device_batch_size=} {self.generations_per_prompt=}"
+        self.total_prompt_batch_size = self.total_batch_size // self.generations_per_prompt
         self.per_device_prompt_batch_size = self.per_device_batch_size // self.generations_per_prompt
+        assert self.per_device_batch_size * self.world_size * self.gradient_accumulation_steps == self.total_batch_size
+        assert self.per_device_prompt_batch_size * self.world_size * self.gradient_accumulation_steps == self.total_prompt_batch_size
         self.dataset_size = cfg.dataset_size
 
         ### eval
         self.eval_freq = cfg.eval_freq
         self.eval_num_samples = cfg.eval_num_samples
-        self.eval_per_device_batch_size = self.per_device_batch_size * 2
-        assert self.eval_num_samples % self.eval_per_device_batch_size == 0, f"{self.eval_num_samples=} {self.eval_per_device_batch_size=}"
+        self.eval_per_device_batch_size = self.per_device_batch_size # * 2
+        # self.eval_per_device_batch_size = 1
         self.eval_num_subbatches = self.eval_num_samples // (self.eval_per_device_batch_size * self.world_size) # like accumulation steps
-        assert self.eval_per_device_batch_size * self.world_size * self.eval_num_subbatches == self.eval_num_samples, f"{self.eval_per_device_batch_size=} {self.world_size=} {self.eval_num_subbatches=} {self.eval_num_samples=}"
+        assert self.eval_per_device_batch_size * self.world_size * self.eval_num_subbatches == self.eval_num_samples
 
         # generation
         self.max_new_tokens = cfg.max_new_tokens
         self.temperature = cfg.temperature
         self.patch_in_answer_prompt = cfg.patch_in_answer_prompt
+
         # reward
         self.cot_reward_type = cfg.cot_reward_type
         self.ans_reward_type = cfg.ans_reward_type
@@ -196,6 +196,7 @@ class Trainer:
         assert self.ans_reward_type in [None, "binary", "prob"], f"{self.ans_reward_type=}"
         assert self.cot_normalization_type in [None, "grpo", "rloo"], f"{self.cot_normalization_type=}"
         assert self.ans_normalization_type in [None, "grpo", "rloo"], f"{self.ans_normalization_type=}"
+        
         # loss
         self.kl_type = cfg.kl_type
         self.kl_coef = cfg.kl_coef
@@ -269,10 +270,9 @@ class Trainer:
             print(f"-----------------------------------\n")
             print(f"---EVAL CONFIG:")
             print(f"Eval freq: {self.eval_freq}")
-            print(f"Eval total batch size: {self.eval_total_batch_size}")
+            print(f"Eval total batch size: {self.eval_num_samples}")
             print(f"Eval per device batch size: {self.eval_per_device_batch_size}")
             print(f"Eval num subbatches: {self.eval_num_subbatches}")
-            print(f"Eval per device prompt batch size: {self.eval_per_device_prompt_batch_size}")
             print(f"-----------------------------------\n")
             print(f"---GENERATION CONFIG:")
             print(f"Max new tokens: {self.max_new_tokens}")
@@ -633,11 +633,10 @@ class Trainer:
 
     def print_metrics(self,
                       decoded_generations,
-                      metrics_s,
                       questions_text,
                       answers_text,
-                      gen_time,
-                      loss_time,
+                      gen_time=None,
+                      loss_time=None,
                       prefix=""
                       ):
         response, ans_gen, ans_argmax, contains_ap, contains_ans, ans_prob, length, cot_r, ans_r = decoded_generations[0]
@@ -645,8 +644,9 @@ class Trainer:
         peak_mem_reserved = torch.cuda.max_memory_reserved() // 1024 // 1024
         # print
         print("-"*50)
-        print(f"Generation time: {gen_time:.1f}s")
-        print(f"Loss time: {loss_time:.1f}s")
+        if gen_time is not None and loss_time is not None:
+            print(f"Generation time: {gen_time:.1f}s")
+            print(f"Loss time: {loss_time:.1f}s")
         print(f"peak memory allocated: {peak_mem_allocated} MiB, reserved: {peak_mem_reserved} MiB")
         print("-"*50)
         print(f"              QUESTION: {questions_text[0]}")
@@ -659,8 +659,9 @@ class Trainer:
         if self.ans_reward_type == "prob" or self.cot_reward_type == "prob":
             print(f"           ANSWER PROB: {ans_prob:.2e}")
         print(f"                LENGTH: {length}")
-        print(f" COT NORMALIZED REWARD: {cot_r:.2e}")
-        print(f" ANS NORMALIZED REWARD: {ans_r:.2e}")
+        if cot_r is not None and ans_r is not None:
+            print(f" COT NORMALIZED REWARD: {cot_r:.2e}")
+            print(f" ANS NORMALIZED REWARD: {ans_r:.2e}")
         print("-"*50)
         print(f"{prefix}")
         print("\n")
@@ -685,30 +686,31 @@ class Trainer:
                         dataset_batch, epoch = next(self.eval_loader)
                         _, decoded_generations, generation_metrics = self.generate(dataset_batch, is_eval=True)
 
-                        # METRICS
-                        if j == 0:
-                            metrics_s = {**generation_metrics}
-                        else:
-                            metrics_s = {k: v + generation_metrics[k] for k, v in metrics_s.items()}
+                    # METRICS
+                    if j == 0:
+                        metrics_s = {**generation_metrics}
+                    else:
+                        metrics_s = {k: v + generation_metrics[k] for k, v in metrics_s.items()}
 
-                        # PRINT
-                        if self.rank == 0:
-                            prefix = f"EVAL: Iter {i+1}/{num_iters}, subbatch {j+1}/{self.eval_num_subbatches}, epoch {epoch}"
-                            self.print_metrics(decoded_generations, metrics_s, dataset_batch["question"], dataset_batch["answer"], gen_time, loss_time, prefix=prefix)
+                    # PRINT
+                    if self.rank == 0:
+                        prefix = f"EVAL: Iter {i+1}/{num_iters}, subbatch {j+1}/{self.eval_num_subbatches}, epoch {epoch}, "
+                        prefix += f"mean contains answer: {metrics_s['gen/contains_answer']/(j+1):.2f}"
+                        self.print_metrics(decoded_generations, dataset_batch["question"], dataset_batch["answer"], prefix=prefix)
 
-                    # LOG
-                    metrics_s = {k: v / self.eval_num_subbatches for k, v in metrics_s.items()}
-                    metrics_s = {f"eval_{k}": v for k, v in metrics_s.items()}
-                    if self.using_ddp:
-                        for k, v in metrics_s.items():
-                            dist.all_reduce(v, op=dist.ReduceOp.AVG)
-                    if self.use_wandb and self.rank == 0:
-                        wandb.log({**metrics_s, "iter": i})
+                # LOG
+                metrics_s = {k: v / self.eval_num_subbatches for k, v in metrics_s.items()}
+                metrics_s = {f"eval_{k}": v for k, v in metrics_s.items()}
+                if self.using_ddp:
+                    for k, v in metrics_s.items():
+                        dist.all_reduce(v, op=dist.ReduceOp.AVG)
+                if self.use_wandb and self.rank == 0:
+                    wandb.log({**metrics_s, "iter": i})
 
-                    # CLEANUP
-                    del dataset_batch, generation_metrics, decoded_generations
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                # CLEANUP
+                del dataset_batch, generation_metrics, decoded_generations
+                gc.collect()
+                torch.cuda.empty_cache()
 
             # TRAIN
             if i < num_iters:
@@ -737,8 +739,9 @@ class Trainer:
 
                     # PRINT
                     if j % 1 == 0 and self.rank == 0:
-                        prefix = f"TRAIN: Iter {i+1}/{num_iters}, acc step {j+1}/{self.gradient_accumulation_steps}, epoch {epoch}"
-                        self.print_metrics(decoded_generations, metrics_s, dataset_batch["question"], dataset_batch["answer"], gen_time, loss_time, prefix=prefix)
+                        prefix = f"TRAIN: Iter {i+1}/{num_iters}, acc step {j+1}/{self.gradient_accumulation_steps}, epoch {epoch} "
+                        prefix += f"mean contains answer: {metrics_s['gen/contains_answer']/(j+1):.2f}"
+                        self.print_metrics(decoded_generations, dataset_batch["question"], dataset_batch["answer"], gen_time, loss_time, prefix=prefix)
 
                     # CLEANUP
                     del dataset_batch, generation_metrics, decoded_generations
