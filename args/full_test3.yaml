@@ -1,5 +1,6 @@
 base_model: Qwen/Qwen2.5-0.5b
-dataset: gsm8k_hash
+# dataset: gsm8k_hash
+dataset: gsm8k
 
 use_wandb: True
 run_name_prefix: "RUNS4"

@@ -420,22 +420,22 @@ class Trainer:
         contains_answer = torch.zeros(full_batch_size, device=self.device)
         # fill in patched tensors and contains
         responses_ids = q_responses_ids[:, question_length:]
-        for i, (reponse_ids, answer_ids) in enumerate(zip(responses_ids, tokenized_answers)):
+        for i, (response_ids, answer_ids) in enumerate(zip(responses_ids, tokenized_answers)):
             answer_length = len(answer_ids)
-            contains_eot[i] = (reponse_ids == self.tokenizer.eos_token_id).any()
+            contains_eot[i] = (response_ids == self.tokenizer.eos_token_id).any()
             if contains_eot[i] == 1:
-                response_eot_idx = (reponse_ids == self.tokenizer.eos_token_id).nonzero(as_tuple=True)[0][0]
+                response_eot_idx = (response_ids == self.tokenizer.eos_token_id).nonzero(as_tuple=True)[0][0]
                 eot_idx = response_eot_idx + question_length
                 reponse_mask[i, eot_idx+1:] = 0
                 patched_cot_mask[i, eot_idx+1:] = 0
-                reponse_ids[response_eot_idx+1:] = self.tokenizer.pad_token_id
-            contains_answer_prompt[i] = (reponse_ids[:-answer_length-1] == self.answer_prompt_id).any()
+                response_ids[response_eot_idx+1:] = self.tokenizer.pad_token_id
+            contains_answer_prompt[i] = (response_ids[:-answer_length-1] == self.answer_prompt_id).any()
             if contains_answer_prompt[i] == 1:
-                response_ap_idx = (reponse_ids == self.answer_prompt_id).nonzero(as_tuple=True)[0][0]
+                response_ap_idx = (response_ids == self.answer_prompt_id).nonzero(as_tuple=True)[0][0]
                 ap_idx = question_length + response_ap_idx
-                assert response_ap_idx + 1 + answer_length < len(reponse_ids), f"{response_ap_idx=} {answer_length=} {len(reponse_ids)=}"
+                assert response_ap_idx + 1 + answer_length < len(response_ids), f"{response_ap_idx=} {answer_length=} {len(response_ids)=}"
                 answer_ids = torch.tensor(answer_ids, device=self.device)
-                contains_answer_i = (reponse_ids[response_ap_idx+1:response_ap_idx+1+answer_length] == answer_ids).all()
+                contains_answer_i = (response_ids[response_ap_idx+1:response_ap_idx+1+answer_length] == answer_ids).all()
                 contains_answer[i] = contains_answer_i
                 patched_q_responses_ids[i, ap_idx+1:ap_idx+1+answer_length] = answer_ids
                 patched_answer_mask[i, ap_idx+1:ap_idx+1+answer_length] = 1
