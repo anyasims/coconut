@@ -212,7 +212,7 @@ class Trainer:
             run_name += f"_{self.cot_normalization_type}" if self.cot_normalization_type is not None else ""
             run_name += f"-ANS{self.ans_reward_type}" if self.ans_reward_type is not None else ""
             run_name += f"_{self.ans_normalization_type}" if self.ans_normalization_type is not None else ""
-            run_name += f"-g{self.generations_per_prompt}" if self.generations_per_prompt != 1 else ""
+            run_name += f"-g{self.generations_per_prompt}"
             # generation
             run_name += f"-PatchAP" if self.patch_in_answer_prompt else ""
             run_name += f"-L{self.max_new_tokens}"
@@ -597,10 +597,6 @@ class Trainer:
             metrics["contains_answer"] = contains_answer.mean()
             metrics["length_to_eot"] = reponse_mask.sum(dim=-1).mean()
             metrics["length_of_cot"] = patched_cot_mask.sum(dim=-1).mean()
-            metrics["cot_logp"] = (cot_logp / patched_cot_mask[:, 1:].sum(dim=-1)).mean()
-            metrics["ans_logp"] = (ans_logp / patched_answer_mask[:, 1:].sum(dim=-1)).mean()
-            metrics["cot_ref_logp"] = (cot_ref_logp / patched_cot_mask[:, 1:].sum(dim=-1)).mean()
-            metrics["ans_ref_logp"] = (ans_ref_logp / patched_answer_mask[:, 1:].sum(dim=-1)).mean()
             metrics["entropy"] = entropy.mean()
             metrics["ref_entropy"] = ref_entropy.mean()
             metrics["sample_kl"] = sample_kl.mean()
