@@ -352,7 +352,7 @@ class Trainer:
                 normalized_reward = (reward - reward.mean(1, keepdim=True)) / (reward.std(1, keepdim=True) + 1e-6)
             elif normalization_type == "rloo":
                 group_sum = reward.sum(1, keepdim=True)
-                normalized_reward = (group_sum - reward) / (self.generations_per_prompt - 1)
+                normalized_reward = (reward - group_sum) / (self.generations_per_prompt - 1)
             elif normalization_type is None:
                 normalized_reward = reward
             else:
@@ -474,14 +474,13 @@ class Trainer:
                     patch_ids = [self.space_id] + self.answer_prompt_ids[0] + answer_ids
                 else:
                     patch_ids = [self.space_id, self.dot_dot_dot_id, self.space_id] + self.answer_prompt_ids[0] + answer_ids
-                patch_start_idx = patched_q_responses_ids.shape[1] - len(patch_ids)
-                if contains_eot[i] == 1:
-                    patch_start_idx = min(patch_start_idx, eot_idx)
-                    answer_start_idx = eot_idx + 2 # for [space, answer_prompt]
-                else:
-                    answer_start_idx = patch_start_idx + 4 # for [space, dot_dot_dot, space, answer_prompt]
                 patch_length = len(patch_ids)
                 answer_length = len(answer_ids)
+                patch_start_idx = patched_q_responses_ids.shape[1] - patch_length
+                if contains_eot[i] == 1:
+                    patch_start_idx = min(patch_start_idx, eot_idx)
+                answer_start_idx = patch_start_idx + patch_length - answer_length
+                
                 patch_ids = torch.tensor(patch_ids, device=self.device)
                 patched_q_responses_ids[i, patch_start_idx:patch_start_idx+patch_length] = patch_ids
                 patched_answer_mask[i, answer_start_idx:answer_start_idx+answer_length] = 1

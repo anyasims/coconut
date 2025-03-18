@@ -234,7 +234,7 @@ class Trainer:
                 normalized_rewards = (rewards - rewards.mean(1, keepdim=True)) / (rewards.std(1, keepdim=True) + 1e-6)
             elif self.pg_normalization_type == "rloo":
                 group_sum = rewards.sum(1, keepdim=True)
-                normalized_rewards = (group_sum - rewards) / (self.generations_per_prompt - 1)
+                normalized_rewards = (rewards - group_sum) / (self.generations_per_prompt - 1)
             elif self.pg_normalization_type == "none":
                 normalized_rewards = rewards
             else:

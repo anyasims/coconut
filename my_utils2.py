@@ -397,7 +397,7 @@ def get_generations(
                 normalized_reward = (reward - reward.mean(1, keepdim=True)) / (reward.std(1, keepdim=True) + 1e-6)
             elif normalization_type == "rloo":
                 group_sum = reward.sum(1, keepdim=True)
-                normalized_reward = (group_sum - reward) / (generations_per_prompt - 1)
+                normalized_reward = (reward - group_sum) / (generations_per_prompt - 1)
             elif normalization_type is None:
                 normalized_reward = reward
             else:
